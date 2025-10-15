@@ -683,6 +683,7 @@ final class ReceiptParserFactory {
     ]
     
     private lazy var smartDetector = SmartStoreDetector(parsers: parsers)
+    private let confidenceScorer = ReceiptConfidenceScorer()
     
     func parseReceipt(from text: String) -> ParsedReceipt? {
         let logger = ReceiptDebugLogger.shared
@@ -702,11 +703,57 @@ final class ReceiptParserFactory {
         if let receipt = match.parser.parse(from: text) {
             logger.logSuccess("Successfully parsed with \(match.storeName) parser")
             logger.log("Parsed \(receipt.products.count) products, total: €\(String(format: "%.2f", receipt.total))")
+            
+            // Calculate confidence score
+            let confidence = confidenceScorer.score(receipt, ocrText: text, storeConfidence: match.confidence)
+            logger.log("Receipt quality: \(confidence.rating.emoji) \(confidence.percentage)%")
+            
+            // Log warning if confidence is not high
+            if confidence.rating == .medium {
+                logger.logWarning("Medium confidence - user should review the results")
+            } else if confidence.rating == .low {
+                logger.logError("Low confidence - results may be unreliable")
+            }
+            
             return receipt
         } else {
             logger.logWarning("Failed to parse with \(match.storeName) parser despite confident detection")
             return tryGenericParser(text)
         }
+    }
+    
+    /// Parse receipt with confidence scoring (returns detailed result)
+    func parseReceiptWithConfidence(from text: String) -> ParsedReceiptWithConfidence? {
+        guard let match = smartDetector.detect(from: text),
+              let receipt = match.parser.parse(from: text) else {
+            return nil
+        }
+        
+        let confidence = confidenceScorer.score(receipt, ocrText: text, storeConfidence: match.confidence)
+        
+        // Collect issues
+        var issues: [String] = []
+        
+        // Add confidence-based issues
+        if confidence.rating == .low {
+            issues.append("Low parsing confidence (\(confidence.percentage)%)")
+        }
+        
+        // Add factor-specific issues
+        if let productCountScore = confidence.factors["product_count"], productCountScore < 0.7 {
+            issues.append("Unusual product count: \(receipt.products.count)")
+        }
+        
+        if let totalScore = confidence.factors["total_consistency"], totalScore < 0.7 {
+            let sum = receipt.products.map(\.price).reduce(0, +)
+            issues.append("Total mismatch: €\(String(format: "%.2f", receipt.total)) vs sum €\(String(format: "%.2f", sum))")
+        }
+        
+        return ParsedReceiptWithConfidence(
+            receipt: receipt,
+            confidence: confidence,
+            issues: issues
+        )
     }
     
     private func tryGenericParser(_ text: String) -> ParsedReceipt? {
@@ -722,6 +769,237 @@ final class ReceiptParserFactory {
         
         logger.logError("All parsers failed, including generic fallback")
         return nil
+    }
+}
+
+// MARK: - Confidence Scoring System
+
+/// Receipt parsing result with confidence score
+struct ParsedReceiptWithConfidence {
+    let receipt: ParsedReceipt
+    let confidence: ReceiptConfidence
+    let issues: [String]
+}
+
+/// Confidence score breakdown
+struct ReceiptConfidence {
+    let overall: Float  // 0.0 - 1.0
+    let factors: [String: Float]
+    
+    var rating: ConfidenceRating {
+        switch overall {
+        case 0.8...1.0: return .high
+        case 0.5..<0.8: return .medium
+        default: return .low
+        }
+    }
+    
+    var percentage: Int {
+        Int(overall * 100)
+    }
+}
+
+/// Confidence rating levels
+enum ConfidenceRating {
+    case high    // ✅ Green - Use automatically
+    case medium  // ⚠️ Orange - Ask user to review
+    case low     // ❌ Red - Needs manual correction
+    
+    var emoji: String {
+        switch self {
+        case .high: return "✅"
+        case .medium: return "⚠️"
+        case .low: return "❌"
+        }
+    }
+    
+    var description: String {
+        switch self {
+        case .high: return "High confidence - Ready to use"
+        case .medium: return "Medium confidence - Please review"
+        case .low: return "Low confidence - Manual correction needed"
+        }
+    }
+}
+
+/// Receipt confidence scorer
+class ReceiptConfidenceScorer {
+    private let logger = ReceiptDebugLogger.shared
+    
+    /// Calculate confidence score for a parsed receipt
+    func score(_ receipt: ParsedReceipt, ocrText: String, storeConfidence: Float = 1.0) -> ReceiptConfidence {
+        logger.section("CONFIDENCE SCORING")
+        
+        var factors: [String: Float] = [:]
+        var issues: [String] = []
+        
+        // Factor 1: Product count (receipts rarely have <2 or >100 items)
+        let productCount = receipt.products.count
+        let productCountScore: Float
+        if productCount >= 2 && productCount <= 100 {
+            productCountScore = 1.0
+        } else if productCount == 1 {
+            productCountScore = 0.6
+            issues.append("Only 1 product found - unusual for a receipt")
+        } else if productCount > 100 {
+            productCountScore = 0.4
+            issues.append("Over 100 products - possible parsing error")
+        } else {
+            productCountScore = 0.2
+            issues.append("No products found")
+        }
+        factors["product_count"] = productCountScore
+        
+        // Factor 2: Price validity (all prices > 0, reasonable range)
+        let validPrices = receipt.products.filter { $0.price > 0 && $0.price < 1000 }.count
+        let priceValidityScore = productCount > 0 ? Float(validPrices) / Float(productCount) : 0.0
+        factors["price_validity"] = priceValidityScore
+        
+        if validPrices < productCount {
+            let invalidCount = productCount - validPrices
+            issues.append("\(invalidCount) product(s) with invalid prices")
+        }
+        
+        // Factor 3: Total consistency (sum of items ≈ total)
+        let itemsSum = receipt.products.map(\.price).reduce(0, +)
+        let totalDiff = abs(itemsSum - receipt.total)
+        let tolerance = max(receipt.total * 0.15, 0.5)  // 15% tolerance or €0.50
+        let totalConsistencyScore: Float
+        
+        if receipt.total == 0.0 {
+            totalConsistencyScore = 0.3
+            issues.append("Total is €0.00")
+        } else if totalDiff < tolerance {
+            totalConsistencyScore = 1.0
+        } else if totalDiff < tolerance * 2 {
+            totalConsistencyScore = 0.7
+            issues.append("Total differs from sum by €\(String(format: "%.2f", totalDiff))")
+        } else {
+            totalConsistencyScore = 0.4
+            issues.append("Total (€\(String(format: "%.2f", receipt.total))) doesn't match sum (€\(String(format: "%.2f", itemsSum)))")
+        }
+        factors["total_consistency"] = totalConsistencyScore
+        
+        // Factor 4: Store detection confidence
+        let storeDetectionScore: Float
+        if receipt.storeName.uppercased() != "UNKNOWN" && receipt.storeName.uppercased() != "GENERIC" {
+            storeDetectionScore = storeConfidence
+        } else {
+            storeDetectionScore = 0.3
+            issues.append("Store not identified")
+        }
+        factors["store_detection"] = storeDetectionScore
+        
+        // Factor 5: OCR quality (check for garbled text)
+        let garbledRatio = calculateGarbledTextRatio(ocrText)
+        let ocrQualityScore = 1.0 - garbledRatio
+        factors["ocr_quality"] = ocrQualityScore
+        
+        if garbledRatio > 0.3 {
+            issues.append("High noise in OCR text (\(Int(garbledRatio * 100))% special chars)")
+        }
+        
+        // Factor 6: Product name quality
+        let productNames = receipt.products.map { $0.name }
+        let avgNameLength = productNames.isEmpty ? 0 : productNames.map { $0.count }.reduce(0, +) / productNames.count
+        let nameQualityScore: Float
+        
+        if avgNameLength > 3 && avgNameLength < 50 {
+            nameQualityScore = 1.0
+        } else if avgNameLength <= 3 {
+            nameQualityScore = 0.4
+            issues.append("Product names too short (avg: \(avgNameLength) chars)")
+        } else {
+            nameQualityScore = 0.6
+            issues.append("Product names unusually long (avg: \(avgNameLength) chars)")
+        }
+        factors["name_quality"] = nameQualityScore
+        
+        // Factor 7: Date validity
+        let dateScore: Float
+        let now = Date()
+        let oneYearAgo = Calendar.current.date(byAdding: .year, value: -1, to: now) ?? now
+        let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: now) ?? now
+        
+        if receipt.date > oneYearAgo && receipt.date < tomorrow {
+            dateScore = 1.0
+        } else if receipt.date < oneYearAgo {
+            dateScore = 0.5
+            issues.append("Receipt date is over 1 year old")
+        } else {
+            dateScore = 0.3
+            issues.append("Receipt date is in the future")
+        }
+        factors["date_validity"] = dateScore
+        
+        // Calculate weighted average
+        let weights: [String: Float] = [
+            "product_count": 0.12,
+            "price_validity": 0.18,
+            "total_consistency": 0.25,
+            "store_detection": 0.15,
+            "ocr_quality": 0.12,
+            "name_quality": 0.10,
+            "date_validity": 0.08
+        ]
+        
+        var overall: Float = 0.0
+        for (key, value) in factors {
+            overall += value * (weights[key] ?? 0.0)
+        }
+        
+        let confidence = ReceiptConfidence(overall: overall, factors: factors)
+        
+        logger.log("Overall confidence: \(confidence.rating.emoji) \(String(format: "%.1f%%", overall * 100)) (\(confidence.rating.description))")
+        logger.logDebug("Factor breakdown:")
+        for (key, value) in factors.sorted(by: { $0.key < $1.key }) {
+            logger.logDebug("  \(key): \(String(format: "%.2f", value))")
+        }
+        
+        if !issues.isEmpty {
+            logger.logWarning("Issues found:")
+            for issue in issues {
+                logger.logWarning("  - \(issue)")
+            }
+        }
+        
+        return confidence
+    }
+    
+    /// Calculate ratio of garbled/special characters
+    private func calculateGarbledTextRatio(_ text: String) -> Float {
+        let totalChars = text.count
+        guard totalChars > 0 else { return 0.0 }
+        
+        // Count problematic patterns
+        var issueCount = 0
+        
+        // Excessive special characters (excluding normal punctuation)
+        let normalChars = CharacterSet.alphanumerics.union(.whitespaces).union(CharacterSet(charactersIn: ".,€$£¥-/()"))
+        let specialChars = text.unicodeScalars.filter { !normalChars.contains($0) }.count
+        issueCount += specialChars
+        
+        // Nonsense patterns
+        let nonsensePatterns = ["###", "|||", "___", "...", "***", "```"]
+        for pattern in nonsensePatterns {
+            issueCount += text.components(separatedBy: pattern).count - 1
+        }
+        
+        return min(Float(issueCount) / Float(totalChars), 1.0)
+    }
+}
+
+// MARK: - Array Extension for Average
+
+extension Array where Element == Int {
+    var average: Double {
+        isEmpty ? 0 : Double(reduce(0, +)) / Double(count)
+    }
+}
+
+extension Array where Element == Float {
+    var average: Float {
+        isEmpty ? 0 : reduce(0, +) / Float(count)
     }
 }
 
