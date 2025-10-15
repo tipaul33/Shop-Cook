@@ -497,13 +497,177 @@ final class EnhancedReceiptOCR {
         return lines.joined(separator: "\n")
     }
     
+    // MARK: - Column-Aware Text Extraction (IMPROVED)
+    
+    /// Extract text with column awareness for better receipt parsing
+    private func extractTextWithColumnAwareness(_ observations: [VNRecognizedTextObservation]) -> String {
+        logger.log("Processing \(observations.count) observations with column awareness")
+        
+        guard !observations.isEmpty else { return "" }
+        
+        // 1. Detect columns (typical receipt has: description | price on right)
+        let columns = detectColumns(observations)
+        logger.log("Detected columns - Left boundary: \(String(format: "%.3f", columns.leftBoundary)), Right boundary: \(String(format: "%.3f", columns.rightBoundary))")
+        
+        // 2. Group observations into rows with adaptive threshold
+        let threshold = adaptiveRowThreshold(for: observations)
+        let rows = groupIntoRows(observations, threshold: threshold)
+        logger.log("Grouped into \(rows.count) rows (threshold: \(String(format: "%.4f", threshold)))")
+        
+        // 3. Reconstruct lines with column awareness
+        var receiptLines: [String] = []
+        
+        for (rowIndex, row) in rows.enumerated() {
+            // Separate left (description) and right (price) columns
+            let leftColumn = row.filter { isInLeftColumn($0, columns) }
+                               .sorted { $0.boundingBox.minX < $1.boundingBox.minX }
+            
+            let rightColumn = row.filter { isInRightColumn($0, columns) }
+                                .sorted { $0.boundingBox.minX < $1.boundingBox.minX }
+            
+            // Build line from columns
+            var lineComponents: [String] = []
+            
+            // Add description (left column)
+            let description = leftColumn.compactMap { 
+                $0.topCandidates(1).first?.string 
+            }.joined(separator: " ")
+            
+            if !description.isEmpty {
+                lineComponents.append(description)
+            }
+            
+            // Add price (right column)
+            let price = rightColumn.compactMap { 
+                $0.topCandidates(1).first?.string 
+            }.joined(separator: " ")
+            
+            if !price.isEmpty {
+                lineComponents.append(price)
+            }
+            
+            // Join with spacing to preserve column structure
+            let line = lineComponents.joined(separator: " ")
+            
+            if !line.isEmpty {
+                receiptLines.append(line)
+                
+                // Debug: Log first 15 lines
+                if rowIndex < 15 {
+                    logger.logTrace("[\(rowIndex)] \(line)")
+                }
+            }
+        }
+        
+        logger.logSuccess("Extracted \(receiptLines.count) receipt lines")
+        return receiptLines.joined(separator: "\n")
+    }
+    
+    /// Detect left and right column boundaries
+    private func detectColumns(_ observations: [VNRecognizedTextObservation]) -> ColumnBoundaries {
+        guard !observations.isEmpty else {
+            return ColumnBoundaries(leftBoundary: 0.5, rightBoundary: 0.5)
+        }
+        
+        // Collect all X positions
+        var xPositions: [CGFloat] = []
+        for obs in observations {
+            xPositions.append(obs.boundingBox.minX)
+            xPositions.append(obs.boundingBox.maxX)
+        }
+        
+        xPositions.sort()
+        
+        // Find natural gap in X positions (indicates column separation)
+        var maxGap: CGFloat = 0
+        var gapPosition: CGFloat = 0.5
+        
+        for i in 0..<(xPositions.count - 1) {
+            let gap = xPositions[i + 1] - xPositions[i]
+            if gap > maxGap && xPositions[i] > 0.2 && xPositions[i] < 0.8 {
+                maxGap = gap
+                gapPosition = (xPositions[i] + xPositions[i + 1]) / 2
+            }
+        }
+        
+        // If we found a significant gap, use it as column boundary
+        if maxGap > 0.1 {
+            return ColumnBoundaries(leftBoundary: gapPosition, rightBoundary: gapPosition)
+        }
+        
+        // Otherwise, use heuristic: most prices are on right 30% of receipt
+        return ColumnBoundaries(leftBoundary: 0.7, rightBoundary: 0.7)
+    }
+    
+    /// Group observations into rows based on Y-coordinate proximity
+    private func groupIntoRows(_ observations: [VNRecognizedTextObservation], threshold: CGFloat) -> [[VNRecognizedTextObservation]] {
+        // Sort by Y-coordinate (top to bottom)
+        let sorted = observations.sorted { $0.boundingBox.midY > $1.boundingBox.midY }
+        
+        var rows: [[VNRecognizedTextObservation]] = []
+        var currentRow: [VNRecognizedTextObservation] = []
+        var lastY: CGFloat?
+        
+        for obs in sorted {
+            let currentY = obs.boundingBox.midY
+            
+            if let lastY = lastY {
+                // If Y difference is within threshold, same row
+                if abs(currentY - lastY) < threshold {
+                    currentRow.append(obs)
+                } else {
+                    // New row
+                    if !currentRow.isEmpty {
+                        rows.append(currentRow)
+                    }
+                    currentRow = [obs]
+                }
+            } else {
+                // First observation
+                currentRow = [obs]
+            }
+            
+            lastY = currentY
+        }
+        
+        // Add last row
+        if !currentRow.isEmpty {
+            rows.append(currentRow)
+        }
+        
+        return rows
+    }
+    
+    /// Calculate adaptive threshold based on text size and density
+    private func adaptiveRowThreshold(for observations: [VNRecognizedTextObservation]) -> CGFloat {
+        guard !observations.isEmpty else { return 0.015 }
+        
+        // Calculate average text height
+        let heights = observations.map { $0.boundingBox.height }
+        let avgHeight = heights.reduce(0, +) / CGFloat(heights.count)
+        
+        // Threshold is 50% of average text height
+        // This adapts to different text sizes
+        return avgHeight * 0.5
+    }
+    
+    /// Check if observation is in left column (description)
+    private func isInLeftColumn(_ obs: VNRecognizedTextObservation, _ columns: ColumnBoundaries) -> Bool {
+        return obs.boundingBox.minX < columns.leftBoundary
+    }
+    
+    /// Check if observation is in right column (price)
+    private func isInRightColumn(_ obs: VNRecognizedTextObservation, _ columns: ColumnBoundaries) -> Bool {
+        return obs.boundingBox.maxX > columns.rightBoundary
+    }
+    
     private func processObservations(
         _ observations: [VNRecognizedTextObservation],
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        // CRITICAL: Use strict mode for better accuracy
-        // This treats each observation as a separate line
-        let extractedText = extractTextFromObservationsStrict(observations)
+        // CRITICAL: Use column-aware extraction for better accuracy
+        // This preserves the receipt structure (description | price)
+        let extractedText = extractTextWithColumnAwareness(observations)
         
         if extractedText.isEmpty {
             logger.log("No text recognized", level: .error)
@@ -546,6 +710,14 @@ final class EnhancedReceiptOCR {
             }
         }
     }
+}
+
+// MARK: - Column Detection Support
+
+/// Represents column boundaries in a receipt
+struct ColumnBoundaries {
+    let leftBoundary: CGFloat  // X-coordinate separating left and right columns
+    let rightBoundary: CGFloat // Same as leftBoundary for simple two-column layout
 }
 
 // MARK: - Multi-Pass OCR Strategy for Difficult Receipts

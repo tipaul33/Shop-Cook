@@ -5,12 +5,659 @@
 import Foundation
 import UIKit
 
-// MARK: - Store-Specific Parser Protocol
+// MARK: - Unified Parser Architecture
+
+/// Main receipt parser protocol
+protocol ReceiptParser {
+    var patterns: ReceiptPatterns { get }
+    func parse(_ text: String) -> ParsedReceipt?
+}
+
+/// Store-specific patterns configuration
+struct ReceiptPatterns {
+    // Store identification
+    let storeIdentifiers: [String]           // ["ALDI", "ALDI SÜD", "ALDT"]
+    let storeName: String                    // Display name
+    
+    // Regex patterns
+    let productLinePattern: NSRegularExpression
+    let pricePattern: NSRegularExpression
+    let totalPattern: NSRegularExpression
+    
+    // Section markers
+    let sectionMarkers: SectionMarkers
+    
+    // Optional patterns for complex receipts
+    let quantityPattern: NSRegularExpression?
+    let weightPattern: NSRegularExpression?
+    
+    // Configuration flags
+    let isMultiLineProduct: Bool
+    let hasArticleNumbers: Bool              // 6-digit article numbers
+    let priceLocation: PriceLocation         // Where prices appear
+}
+
+/// Defines where prices appear on receipt
+enum PriceLocation {
+    case sameLine           // "Product Name 2.50"
+    case nextLine           // "Product Name\n2.50"
+    case separateColumn     // "Product Name        2.50"
+}
+
+/// Section boundary markers
+struct SectionMarkers {
+    let productSectionStart: [String]        // Patterns to find start
+    let productSectionEnd: [String]          // ["SUMME", "TOTAL", "GESAMT"]
+    let ignoreLines: [String]                // ["MwSt", "USt", "Pfand"]
+    let headerKeywords: [String]             // Skip these in header
+}
+
+// MARK: - Unified Base Parser
+
+/// Base parser with common logic - eliminates code duplication
+class UnifiedReceiptParser: ReceiptParser {
+    let patterns: ReceiptPatterns
+    let logger = ReceiptDebugLogger.shared
+    
+    init(patterns: ReceiptPatterns) {
+        self.patterns = patterns
+    }
+    
+    func parse(_ text: String) -> ParsedReceipt? {
+        logger.section("UNIFIED PARSER: \(patterns.storeName)")
+        
+        let lines = preprocessText(text)
+        logger.log("Processing \(lines.count) lines")
+        
+        // 1. Extract date
+        let date = extractDate(from: lines)
+        
+        // 2. Find product section boundaries
+        guard let (startIdx, endIdx) = findProductSection(in: lines) else {
+            logger.logError("Could not find product section")
+            return nil
+        }
+        
+        logger.log("Product section: lines \(startIdx) to \(endIdx)")
+        
+        // 3. Parse products
+        let productLines = Array(lines[startIdx..<endIdx])
+        let products = parseProducts(from: productLines)
+        
+        logger.logSuccess("Parsed \(products.count) products")
+        
+        // 4. Extract total
+        var total = extractTotal(from: lines, afterLine: endIdx)
+        
+        // Fallback: calculate from products
+        if total == 0.0 {
+            total = products.map { $0.price }.reduce(0, +)
+            logger.logWarning("No total found, calculated: €\(String(format: "%.2f", total))")
+        }
+        
+        guard !products.isEmpty else {
+            logger.logError("No products found")
+            return nil
+        }
+        
+        return ParsedReceipt(
+            storeName: patterns.storeName,
+            date: date,
+            total: total,
+            products: products
+        )
+    }
+    
+    // MARK: - Common Parsing Logic
+    
+    private func preprocessText(_ text: String) -> [String] {
+        return text
+            .replacingOccurrences(of: "€", with: "")
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+    
+    private func findProductSection(in lines: [String]) -> (Int, Int)? {
+        var startIdx: Int?
+        var endIdx: Int?
+        
+        // Find start
+        for (i, line) in lines.enumerated() {
+            // Skip header lines
+            let upper = line.uppercased()
+            if patterns.sectionMarkers.headerKeywords.contains(where: { upper.contains($0) }) {
+                continue
+            }
+            
+            // Check start patterns
+            for pattern in patterns.sectionMarkers.productSectionStart {
+                if line.range(of: pattern, options: .regularExpression) != nil {
+                    startIdx = i
+                    logger.log("Product section starts at line \(i): \(line)")
+                    break
+                }
+            }
+            
+            if startIdx != nil { break }
+        }
+        
+        guard let start = startIdx else { return nil }
+        
+        // Find end
+        for i in (start + 1)..<lines.count {
+            let upper = lines[i].uppercased()
+            if patterns.sectionMarkers.productSectionEnd.contains(where: { upper.contains($0) }) {
+                endIdx = i
+                logger.log("Product section ends at line \(i): \(lines[i])")
+                break
+            }
+        }
+        
+        return (start, endIdx ?? lines.count)
+    }
+    
+    private func parseProducts(from lines: [String]) -> [ParsedProduct] {
+        var products: [ParsedProduct] = []
+        var i = 0
+        
+        while i < lines.count {
+            let line = lines[i]
+            
+            // Skip ignore lines
+            if shouldIgnoreLine(line) {
+                i += 1
+                continue
+            }
+            
+            // Try to parse based on price location
+            switch patterns.priceLocation {
+            case .sameLine:
+                if let product = parseSameLineProduct(line) {
+                    products.append(product)
+                }
+                i += 1
+                
+            case .nextLine:
+                if let product = parseMultiLineProduct(lines: lines, startIndex: i) {
+                    products.append(product)
+                    i = product.linesConsumed
+                } else {
+                    i += 1
+                }
+                
+            case .separateColumn:
+                if let product = parseColumnProduct(line) {
+                    products.append(product)
+                }
+                i += 1
+            }
+        }
+        
+        return products
+    }
+    
+    private func parseSameLineProduct(_ line: String) -> ParsedProduct? {
+        let nsRange = NSRange(line.startIndex..., in: line)
+        
+        guard let match = patterns.productLinePattern.firstMatch(in: line, range: nsRange) else {
+            return nil
+        }
+        
+        // Extract name and price based on capture groups
+        guard let nameRange = Range(match.range(at: patterns.hasArticleNumbers ? 2 : 1), in: line),
+              let priceRange = Range(match.range(at: patterns.hasArticleNumbers ? 3 : 2), in: line) else {
+            return nil
+        }
+        
+        let name = String(line[nameRange]).trimmingCharacters(in: .whitespaces)
+        let price = parsePrice(String(line[priceRange]))
+        
+        guard isFoodItem(name), price > 0 else { return nil }
+        
+        return ParsedProduct(
+            rawLine: line,
+            name: cleanProductName(name),
+            price: price,
+            section: categorizeProduct(name)
+        )
+    }
+    
+    private func parseMultiLineProduct(lines: [String], startIndex: Int) -> (product: ParsedProduct, linesConsumed: Int)? {
+        guard startIndex < lines.count else { return nil }
+        
+        let line = lines[startIndex]
+        
+        // Look for price in next few lines
+        for offset in 1...3 {
+            let priceIdx = startIndex + offset
+            guard priceIdx < lines.count else { break }
+            
+            let priceLine = lines[priceIdx]
+            let nsRange = NSRange(priceLine.startIndex..., in: priceLine)
+            
+            if patterns.pricePattern.firstMatch(in: priceLine, range: nsRange) != nil {
+                let price = parsePrice(priceLine)
+                
+                guard isFoodItem(line), price > 0 else { return nil }
+                
+                let product = ParsedProduct(
+                    rawLine: line,
+                    name: cleanProductName(line),
+                    price: price,
+                    section: categorizeProduct(line)
+                )
+                
+                return (product, priceIdx + 1)
+            }
+        }
+        
+        return nil
+    }
+    
+    private func parseColumnProduct(_ line: String) -> ParsedProduct? {
+        let nsRange = NSRange(line.startIndex..., in: line)
+        
+        guard let match = patterns.productLinePattern.firstMatch(in: line, range: nsRange) else {
+            return nil
+        }
+        
+        // Similar to sameLine but handles column spacing
+        return parseSameLineProduct(line)
+    }
+    
+    private func extractTotal(from lines: [String], afterLine: Int) -> Double {
+        for i in max(0, afterLine - 5)..<min(lines.count, afterLine + 15) {
+            let line = lines[i]
+            let nsRange = NSRange(line.startIndex..., in: line)
+            
+            if let match = patterns.totalPattern.firstMatch(in: line, range: nsRange) {
+                // Try to extract from capture group, or from whole match
+                if match.numberOfRanges > 1, let priceRange = Range(match.range(at: 1), in: line) {
+                    return parsePrice(String(line[priceRange]))
+                } else if let matchRange = Range(match.range, in: line) {
+                    return parsePrice(String(line[matchRange]))
+                }
+            }
+        }
+        
+        return 0.0
+    }
+    
+    private func extractDate(from lines: [String]) -> Date {
+        let dateFormats = ["dd.MM.yyyy HH:mm", "dd.MM.yy HH:mm", "yyyy-MM-dd HH:mm"]
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        
+        for line in lines.prefix(20) {
+            for format in dateFormats {
+                dateFormatter.dateFormat = format
+                if let date = dateFormatter.date(from: line) {
+                    return date
+                }
+            }
+        }
+        
+        return Date()
+    }
+    
+    private func shouldIgnoreLine(_ line: String) -> Bool {
+        let upper = line.uppercased()
+        return patterns.sectionMarkers.ignoreLines.contains(where: { upper.contains($0) })
+    }
+    
+    private func parsePrice(_ str: String) -> Double {
+        let normalized = str
+            .replacingOccurrences(of: ",", with: ".")
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "EUR", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        return Double(normalized) ?? 0.0
+    }
+    
+    private func isFoodItem(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        let nonFoodKeywords = ["pfand", "tüte", "tasche", "bag", "sac"]
+        return !nonFoodKeywords.contains(where: { lower.contains($0) })
+    }
+    
+    private func cleanProductName(_ name: String) -> String {
+        return name
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+    }
+    
+    private func categorizeProduct(_ name: String) -> ProductSection {
+        let lower = name.lowercased()
+        
+        // Fridge
+        if lower.contains("milch") || lower.contains("joghurt") || lower.contains("käse") ||
+           lower.contains("butter") || lower.contains("wurst") || lower.contains("fleisch") {
+            return .fridge
+        }
+        
+        // Freezer
+        if lower.contains("eis") || lower.contains("tiefkühl") || lower.contains("frozen") {
+            return .freezer
+        }
+        
+        return .pantry
+    }
+}
+
+// MARK: - Legacy Store-Specific Parser Protocol (for compatibility)
 
 protocol StoreReceiptParser {
     var storeName: String { get }
     func canParse(_ text: String) -> Bool
     func parse(from text: String) -> ParsedReceipt?
+}
+
+// MARK: - Example: Simplified Store Parsers Using Unified Architecture
+
+/// Example: LIDL parser using unified architecture - only ~30 lines!
+class UnifiedLidlParser: UnifiedReceiptParser, StoreReceiptParser {
+    var storeName: String { patterns.storeName }
+    
+    init() {
+        let patterns = ReceiptPatterns(
+            storeIdentifiers: ["LIDL", "LID"],
+            storeName: "LIDL",
+            productLinePattern: try! NSRegularExpression(
+                pattern: #"^(.+?)\s+(\d{1,3}[.,]\d{2})\s*[AB]?$"#
+            ),
+            pricePattern: try! NSRegularExpression(
+                pattern: #"\d{1,3}[.,]\d{2}"#
+            ),
+            totalPattern: try! NSRegularExpression(
+                pattern: #"(?:SUMME|TOTAL|GESAMT).*?(\d{1,3}[.,]\d{2})"#
+            ),
+            sectionMarkers: SectionMarkers(
+                productSectionStart: [#"^[A-ZÄÖÜa-zäöüß].+\d{1,3}[.,]\d{2}"#],
+                productSectionEnd: ["SUMME", "TOTAL", "ZWISCHENSUMME"],
+                ignoreLines: ["PFAND", "MWST", "UST"],
+                headerKeywords: ["LIDL", "ADRESSE", "TEL"]
+            ),
+            quantityPattern: nil,
+            weightPattern: nil,
+            isMultiLineProduct: false,
+            hasArticleNumbers: false,
+            priceLocation: .sameLine
+        )
+        super.init(patterns: patterns)
+    }
+    
+    func canParse(_ text: String) -> Bool {
+        let upper = text.uppercased()
+        return patterns.storeIdentifiers.contains(where: { upper.contains($0) })
+    }
+}
+
+/// Example: REWE parser using unified architecture - only ~35 lines!
+class UnifiedReweParser: UnifiedReceiptParser, StoreReceiptParser {
+    var storeName: String { patterns.storeName }
+    
+    init() {
+        let patterns = ReceiptPatterns(
+            storeIdentifiers: ["REWE", "REW"],
+            storeName: "REWE",
+            productLinePattern: try! NSRegularExpression(
+                pattern: #"^(\d{13})\s+(.+?)\s+(\d{1,3}[.,]\d{2})\s*[AB]?$"#
+            ),
+            pricePattern: try! NSRegularExpression(
+                pattern: #"\d{1,3}[.,]\d{2}"#
+            ),
+            totalPattern: try! NSRegularExpression(
+                pattern: #"(?:SUMME|GESAMT|EUR).*?(\d{1,3}[.,]\d{2})"#
+            ),
+            sectionMarkers: SectionMarkers(
+                productSectionStart: [#"^\d{13}"#],  // EAN barcode
+                productSectionEnd: ["SUMME", "ZWISCHENSUMME", "GESAMT"],
+                ignoreLines: ["PFAND", "MWST", "MEHRWERTSTEUER"],
+                headerKeywords: ["REWE", "MARKT"]
+            ),
+            quantityPattern: try! NSRegularExpression(
+                pattern: #"^(\d+)\s+x\s+(\d+[.,]\d{2})"#
+            ),
+            weightPattern: nil,
+            isMultiLineProduct: false,
+            hasArticleNumbers: true,
+            priceLocation: .sameLine
+        )
+        super.init(patterns: patterns)
+    }
+    
+    func canParse(_ text: String) -> Bool {
+        let upper = text.uppercased()
+        return patterns.storeIdentifiers.contains(where: { upper.contains($0) })
+    }
+}
+
+// MARK: - Intelligent Store Detection
+
+/// Store detection result with confidence score
+struct StoreMatch {
+    let storeName: String
+    let parser: StoreReceiptParser
+    let confidence: Float
+    let reasoning: [String: Float]  // Factor scores
+}
+
+/// Smart store detector using multi-factor analysis
+class SmartStoreDetector {
+    private let parsers: [StoreReceiptParser]
+    private let logger = ReceiptDebugLogger.shared
+    
+    init(parsers: [StoreReceiptParser]) {
+        self.parsers = parsers
+    }
+    
+    /// Detect store using multiple factors
+    func detect(from text: String) -> StoreMatch? {
+        logger.section("INTELLIGENT STORE DETECTION")
+        logger.log("Analyzing text with \(parsers.count) store signatures")
+        
+        let lines = text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        
+        var matches: [StoreMatch] = []
+        
+        for parser in parsers {
+            // Calculate multi-factor score
+            let nameScore = detectByName(text, storeName: parser.storeName) * 0.50
+            let structureScore = detectByStructure(lines, storeName: parser.storeName) * 0.30
+            let patternScore = detectByPatterns(lines, storeName: parser.storeName) * 0.20
+            
+            let totalScore = nameScore + structureScore + patternScore
+            
+            if totalScore > 0.3 {  // Minimum confidence threshold
+                let match = StoreMatch(
+                    storeName: parser.storeName,
+                    parser: parser,
+                    confidence: totalScore,
+                    reasoning: [
+                        "name": nameScore,
+                        "structure": structureScore,
+                        "pattern": patternScore
+                    ]
+                )
+                matches.append(match)
+                
+                logger.logDebug("\(parser.storeName): score=\(String(format: "%.2f", totalScore)) (name:\(String(format: "%.2f", nameScore)), struct:\(String(format: "%.2f", structureScore)), pattern:\(String(format: "%.2f", patternScore)))")
+            }
+        }
+        
+        // Return best match
+        guard let bestMatch = matches.max(by: { $0.confidence < $1.confidence }) else {
+            logger.logWarning("No store matched with sufficient confidence")
+            return nil
+        }
+        
+        logger.logSuccess("Best match: \(bestMatch.storeName) with confidence \(String(format: "%.1f%%", bestMatch.confidence * 100))")
+        return bestMatch
+    }
+    
+    // MARK: - Detection Factors
+    
+    /// Factor 1: Name matching (50% weight)
+    private func detectByName(_ text: String, storeName: String) -> Float {
+        let upper = text.uppercased()
+        
+        // Store-specific name patterns with OCR error tolerance
+        let storePatterns: [String: [String]] = [
+            "ALDI Süd": ["ALDI", "SÜD", "SUED", "ALDT", "ALDO", "S00D", "SOOD"],
+            "ALDI Nord": ["ALDI", "NORD", "ALDT", "ALDO", "N0RD", "NORO"],
+            "LIDL": ["LIDL", "LID", "L1DL"],
+            "REWE": ["REWE", "REW"],
+            "EDEKA": ["EDEKA", "EDEXA", "EDKA"],
+            "PENNY": ["PENNY", "PENY"],
+            "NETTO": ["NETTO", "NET0"],
+            "Carrefour": ["CARREFOUR", "CARREF0UR"],
+            "E.Leclerc": ["LECLERC", "LECLERK", "E.LECLERC"],
+            "Intermarché": ["INTERMARCHE", "INTERMARCH"],
+            "Auchan": ["AUCHAN", "AUCH4N"],
+            "Casino": ["CASINO", "CASIN0"]
+        ]
+        
+        guard let patterns = storePatterns[storeName] else { return 0.0 }
+        
+        var score: Float = 0.0
+        var matchCount = 0
+        
+        for pattern in patterns {
+            if upper.contains(pattern) {
+                matchCount += 1
+            }
+        }
+        
+        // Score based on pattern matches
+        if matchCount >= 2 {
+            score = 1.0  // Strong match (multiple patterns)
+        } else if matchCount == 1 {
+            score = 0.7  // Moderate match (single pattern)
+        }
+        
+        return score
+    }
+    
+    /// Factor 2: Receipt structure analysis (30% weight)
+    private func detectByStructure(_ lines: [String], storeName: String) -> Float {
+        var score: Float = 0.0
+        
+        switch storeName {
+        case "ALDI Süd", "ALDI Nord":
+            // ALDI: 6-digit article numbers on separate lines
+            let articleNumberCount = lines.filter { line in
+                line.range(of: #"^\d{6}$"#, options: .regularExpression) != nil
+            }.count
+            
+            if articleNumberCount > 5 {
+                score = 1.0  // Strong ALDI indicator
+            } else if articleNumberCount > 2 {
+                score = 0.6  // Moderate indicator
+            }
+            
+        case "LIDL":
+            // LIDL: Simple "Product  Price" format, no article numbers
+            let simpleLineCount = lines.filter { line in
+                line.range(of: #"^[A-ZÄÖÜa-zäöüß].+\s+\d{1,3}[.,]\d{2}\s*[AB]?$"#, options: .regularExpression) != nil
+            }.count
+            
+            let hasNoArticleNumbers = lines.filter { line in
+                line.range(of: #"^\d{6,13}$"#, options: .regularExpression) != nil
+            }.count == 0
+            
+            if simpleLineCount > 5 && hasNoArticleNumbers {
+                score = 1.0
+            } else if simpleLineCount > 3 {
+                score = 0.6
+            }
+            
+        case "REWE":
+            // REWE: 13-digit EAN barcodes
+            let eanCount = lines.filter { line in
+                line.range(of: #"^\d{13}$"#, options: .regularExpression) != nil
+            }.count
+            
+            if eanCount > 3 {
+                score = 1.0
+            } else if eanCount > 1 {
+                score = 0.7
+            }
+            
+        case "EDEKA":
+            // EDEKA: Often has "E center" or "E aktiv markt"
+            if lines.contains(where: { $0.uppercased().contains("E CENTER") || $0.uppercased().contains("E AKTIV") }) {
+                score = 0.9
+            }
+            
+        case "Carrefour":
+            // Carrefour: French format with "€" symbol and specific keywords
+            let hasFrenchTotal = lines.contains(where: { 
+                $0.uppercased().contains("TOTAL") || $0.uppercased().contains("MONTANT")
+            })
+            if hasFrenchTotal {
+                score = 0.7
+            }
+            
+        default:
+            score = 0.0
+        }
+        
+        return score
+    }
+    
+    /// Factor 3: Product pattern analysis (20% weight)
+    private func detectByPatterns(_ lines: [String], storeName: String) -> Float {
+        var score: Float = 0.0
+        
+        // Analyze footer/total section patterns
+        let footerLines = Array(lines.suffix(15))
+        
+        switch storeName {
+        case "ALDI Süd", "ALDI Nord":
+            // ALDI: "Betrag" keyword for total
+            if footerLines.contains(where: { $0.uppercased().contains("BETRAG") }) {
+                score += 0.5
+            }
+            // ALDI: "K-U-N-D-E" section marker
+            if footerLines.contains(where: { $0.uppercased().contains("K-U-N-D-E") }) {
+                score += 0.5
+            }
+            
+        case "LIDL":
+            // LIDL: "SUMME" or "ZWISCHENSUMME"
+            if footerLines.contains(where: { $0.uppercased().contains("SUMME") }) {
+                score += 0.6
+            }
+            
+        case "REWE":
+            // REWE: "GESAMT EUR" pattern
+            if footerLines.contains(where: { 
+                $0.uppercased().contains("GESAMT") && $0.uppercased().contains("EUR")
+            }) {
+                score += 0.7
+            }
+            
+        case "Carrefour":
+            // Carrefour: "TOTAL TTC"
+            if footerLines.contains(where: { $0.uppercased().contains("TOTAL TTC") }) {
+                score = 1.0
+            }
+            
+        case "E.Leclerc":
+            // Leclerc: Specific footer patterns
+            if footerLines.contains(where: { $0.uppercased().contains("TICKET") }) {
+                score += 0.6
+            }
+            
+        default:
+            break
+        }
+        
+        return min(score, 1.0)  // Cap at 1.0
+    }
 }
 
 // MARK: - Parser Factory
@@ -35,41 +682,41 @@ final class ReceiptParserFactory {
         CasinoParser()
     ]
     
+    private lazy var smartDetector = SmartStoreDetector(parsers: parsers)
+    
     func parseReceipt(from text: String) -> ParsedReceipt? {
         let logger = ReceiptDebugLogger.shared
-        logger.section("STORE DETECTION AND PARSING")
+        logger.section("SMART STORE DETECTION AND PARSING")
         logger.log("Input text length: \(text.count) characters")
-        logger.logTrace("Text preview: \(String(text.prefix(200)))...")
         
-        // Try each parser
-        for (index, parser) in parsers.enumerated() {
-            logger.logDebug("Testing parser \(index + 1)/\(parsers.count): \(parser.storeName)")
-            
-            if parser.canParse(text) {
-                logger.logSuccess("Store detected: \(parser.storeName)")
-                
-                logger.logDebug("Attempting to parse with \(parser.storeName) parser")
-                if let receipt = parser.parse(from: text) {
-                    logger.logSuccess("Successfully parsed with \(parser.storeName) parser")
-                    logger.log("Parsed \(receipt.products.count) products, total: \(receipt.total)")
-                    return receipt
-                } else {
-                    logger.logWarning("Failed to parse with \(parser.storeName) parser despite detection")
-                }
-            } else {
-                logger.logTrace("Parser \(parser.storeName) cannot parse this text")
-            }
+        // Use intelligent multi-factor detection
+        guard let match = smartDetector.detect(from: text) else {
+            logger.logWarning("No store detected with sufficient confidence")
+            return tryGenericParser(text)
         }
         
-        logger.logWarning("No store-specific parser matched")
-        logger.logDebug("Available parsers tested: \(parsers.map { $0.storeName }.joined(separator: ", "))")
+        logger.logSuccess("Detected: \(match.storeName) (confidence: \(String(format: "%.1f%%", match.confidence * 100)))")
+        logger.logDebug("Reasoning - Name: \(String(format: "%.2f", match.reasoning["name"] ?? 0)), Structure: \(String(format: "%.2f", match.reasoning["structure"] ?? 0)), Pattern: \(String(format: "%.2f", match.reasoning["pattern"] ?? 0))")
         
-        // Try generic fallback parser
+        // Parse with detected store's parser
+        if let receipt = match.parser.parse(from: text) {
+            logger.logSuccess("Successfully parsed with \(match.storeName) parser")
+            logger.log("Parsed \(receipt.products.count) products, total: €\(String(format: "%.2f", receipt.total))")
+            return receipt
+        } else {
+            logger.logWarning("Failed to parse with \(match.storeName) parser despite confident detection")
+            return tryGenericParser(text)
+        }
+    }
+    
+    private func tryGenericParser(_ text: String) -> ParsedReceipt? {
+        let logger = ReceiptDebugLogger.shared
         logger.logWarning("Attempting generic fallback parser...")
+        
         let genericParser = GenericReceiptParser()
         if let receipt = genericParser.parse(from: text) {
             logger.logSuccess("Generic parser succeeded")
-            logger.log("Parsed \(receipt.products.count) products, total: \(receipt.total)")
+            logger.log("Parsed \(receipt.products.count) products, total: €\(String(format: "%.2f", receipt.total))")
             return receipt
         }
         
