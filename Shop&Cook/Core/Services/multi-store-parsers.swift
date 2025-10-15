@@ -63,7 +63,7 @@ class UnifiedReceiptParser: ReceiptParser {
         self.patterns = patterns
     }
     
-    func parse(_ text: String) -> ParsedReceipt? {
+    func parse(from text: String) -> ParsedReceipt? {
         logger.section("UNIFIED PARSER: \(patterns.storeName)")
         
         let lines = preprocessText(text)
