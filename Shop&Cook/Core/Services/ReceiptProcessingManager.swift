@@ -720,67 +720,266 @@ struct ColumnBoundaries {
     let rightBoundary: CGFloat // Same as leftBoundary for simple two-column layout
 }
 
-// MARK: - Multi-Pass OCR Strategy for Difficult Receipts
+// MARK: - Image Preprocessing Cache
+
+/// High-performance cache for preprocessed images
+final class ImagePreprocessingCache {
+    static let shared = ImagePreprocessingCache()
+    
+    private let cache = NSCache<NSString, UIImage>()
+    private let enhancedCache = NSCache<NSString, UIImage>()
+    private let invertedCache = NSCache<NSString, UIImage>()
+    private let croppedCache = NSCache<NSString, UIImage>()
+    
+    private init() {
+        // Configure cache limits
+        cache.countLimit = 20          // Keep 20 preprocessed images
+        cache.totalCostLimit = 50_000_000  // ~50MB
+        
+        enhancedCache.countLimit = 10
+        enhancedCache.totalCostLimit = 25_000_000
+        
+        invertedCache.countLimit = 10
+        invertedCache.totalCostLimit = 25_000_000
+        
+        croppedCache.countLimit = 15
+        croppedCache.totalCostLimit = 40_000_000
+        
+        ReceiptDebugLogger.shared.logDebug("ImagePreprocessingCache initialized")
+    }
+    
+    // MARK: - Cache Keys
+    
+    private func cacheKey(for image: UIImage, suffix: String = "") -> NSString {
+        // Use image size + scale as key (more reliable than hash)
+        let key = "\(Int(image.size.width))x\(Int(image.size.height))@\(image.scale)\(suffix)"
+        return key as NSString
+    }
+    
+    // MARK: - Standard Preprocessing Cache
+    
+    func getPreprocessed(_ image: UIImage) -> UIImage? {
+        let key = cacheKey(for: image, suffix: "_preprocessed")
+        
+        if let cached = cache.object(forKey: key) {
+            ReceiptDebugLogger.shared.logDebug("✅ Cache hit: preprocessed image")
+            return cached
+        }
+        
+        return nil
+    }
+    
+    func setPreprocessed(_ image: UIImage, processed: UIImage) {
+        let key = cacheKey(for: image, suffix: "_preprocessed")
+        let cost = Int(processed.size.width * processed.size.height * processed.scale)
+        cache.setObject(processed, forKey: key, cost: cost)
+        ReceiptDebugLogger.shared.logDebug("💾 Cached preprocessed image")
+    }
+    
+    // MARK: - Enhanced Image Cache
+    
+    func getEnhanced(_ image: UIImage, level: MultiPassOCRStrategy.EnhancementLevel) -> UIImage? {
+        let key = cacheKey(for: image, suffix: "_enhanced_\(level)")
+        
+        if let cached = enhancedCache.object(forKey: key) {
+            ReceiptDebugLogger.shared.logDebug("✅ Cache hit: enhanced image")
+            return cached
+        }
+        
+        // Generate and cache
+        if let enhanced = MultiPassOCRStrategy.shared.applyEnhancement(image, level: level) {
+            let cost = Int(enhanced.size.width * enhanced.size.height * enhanced.scale)
+            enhancedCache.setObject(enhanced, forKey: key, cost: cost)
+            ReceiptDebugLogger.shared.logDebug("💾 Cached enhanced image")
+            return enhanced
+        }
+        
+        return nil
+    }
+    
+    // MARK: - Inverted Image Cache
+    
+    func getInverted(_ image: UIImage) -> UIImage? {
+        let key = cacheKey(for: image, suffix: "_inverted")
+        
+        if let cached = invertedCache.object(forKey: key) {
+            ReceiptDebugLogger.shared.logDebug("✅ Cache hit: inverted image")
+            return cached
+        }
+        
+        // Generate and cache
+        if let inverted = MultiPassOCRStrategy.shared.invertImage(image) {
+            let cost = Int(inverted.size.width * inverted.size.height * inverted.scale)
+            invertedCache.setObject(inverted, forKey: key, cost: cost)
+            ReceiptDebugLogger.shared.logDebug("💾 Cached inverted image")
+            return inverted
+        }
+        
+        return nil
+    }
+    
+    // MARK: - Cropped Image Cache
+    
+    func getCropped(_ image: UIImage) -> UIImage? {
+        let key = cacheKey(for: image, suffix: "_cropped")
+        
+        if let cached = croppedCache.object(forKey: key) {
+            ReceiptDebugLogger.shared.logDebug("✅ Cache hit: cropped image")
+            return cached
+        }
+        
+        return nil
+    }
+    
+    func setCropped(_ image: UIImage, cropped: UIImage) {
+        let key = cacheKey(for: image, suffix: "_cropped")
+        let cost = Int(cropped.size.width * cropped.size.height * cropped.scale)
+        croppedCache.setObject(cropped, forKey: key, cost: cost)
+        ReceiptDebugLogger.shared.logDebug("💾 Cached cropped image")
+    }
+    
+    // MARK: - Cache Management
+    
+    func clearCache() {
+        cache.removeAllObjects()
+        enhancedCache.removeAllObjects()
+        invertedCache.removeAllObjects()
+        croppedCache.removeAllObjects()
+        ReceiptDebugLogger.shared.log("🗑️ Image cache cleared")
+    }
+    
+    func getCacheStatistics() -> CacheStatistics {
+        // Note: NSCache doesn't expose count, so these are estimates
+        return CacheStatistics(
+            estimatedSize: "~25-100MB",
+            maxImages: 20,
+            cacheHitRate: "Unknown (not tracked)"
+        )
+    }
+}
+
+struct CacheStatistics {
+    let estimatedSize: String
+    let maxImages: Int
+    let cacheHitRate: String
+}
+
+// MARK: - Performance-Optimized Multi-Pass OCR Strategy
 
 final class MultiPassOCRStrategy {
     
     static let shared = MultiPassOCRStrategy()
     private let logger = ReceiptDebugLogger.shared
+    private let imageCache = ImagePreprocessingCache.shared
     
-    /// Try multiple OCR strategies and combine results
+    /// Try multiple OCR strategies in parallel (async/await)
+    func recognizeWithMultiPass(image: UIImage) async -> String? {
+        logger.section("PARALLEL MULTI-PASS OCR STRATEGY")
+        let startTime = CFAbsoluteTimeGetCurrent()
+        
+        // Run all OCR passes in parallel using TaskGroup
+        let results = await withTaskGroup(of: (String?, String).self, returning: [String].self) { group in
+            // Pass 1: Standard OCR
+            group.addTask {
+                let result = await self.performStandardOCR(image)
+                return (result, "standard")
+            }
+            
+            // Pass 2: Enhanced contrast image
+            group.addTask {
+                let result = await self.performEnhancedOCR(image)
+                return (result, "enhanced")
+            }
+            
+            // Pass 3: Inverted (white on black)
+            group.addTask {
+                let result = await self.performInvertedOCR(image)
+                return (result, "inverted")
+            }
+            
+            // Collect results
+            var collectedResults: [String] = []
+            for await (text, passName) in group {
+                if let text = text {
+                    collectedResults.append(text)
+                    self.logger.log("Pass '\(passName)': \(text.count) chars", level: .success)
+                } else {
+                    self.logger.logDebug("Pass '\(passName)': failed")
+                }
+            }
+            return collectedResults
+        }
+        
+        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+        logger.log("Parallel multi-pass complete: \(results.count)/3 passes succeeded in \(String(format: "%.2f", elapsed))s")
+        
+        if results.isEmpty {
+            return nil
+        }
+        
+        // Select best result (longest = most complete)
+        let best = results.max(by: { $0.count < $1.count })
+        logger.log("Selected best result: \(best?.count ?? 0) chars", level: .success)
+        return best
+    }
+    
+    /// Legacy callback-based interface for compatibility
     func recognizeWithMultiPass(
         image: UIImage,
         completion: @escaping (String?) -> Void
     ) {
-        logger.section("MULTI-PASS OCR STRATEGY")
-        
-        var results: [String] = []
-        let group = DispatchGroup()
-        
-        // Pass 1: Standard OCR
-        group.enter()
-        EnhancedReceiptOCR.shared.recognizeText(from: image) { result in
-            if case .success(let text) = result {
-                results.append(text)
-                self.logger.log("Pass 1 (standard): \(text.count) chars", level: .success)
+        Task {
+            let result = await recognizeWithMultiPass(image: image)
+            await MainActor.run {
+                completion(result)
             }
-            group.leave()
+        }
+    }
+    
+    // MARK: - Parallel OCR Tasks
+    
+    private func performStandardOCR(_ image: UIImage) async -> String? {
+        return await withCheckedContinuation { continuation in
+            EnhancedReceiptOCR.shared.recognizeText(from: image) { result in
+                if case .success(let text) = result {
+                    continuation.resume(returning: text)
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+    
+    private func performEnhancedOCR(_ image: UIImage) async -> String? {
+        // Use cached enhanced image if available
+        guard let enhanced = imageCache.getEnhanced(image, level: .high) else {
+            return nil
         }
         
-        // Pass 2: Enhanced contrast image
-        if let enhanced = applyEnhancement(image, level: .high) {
-            group.enter()
+        return await withCheckedContinuation { continuation in
             EnhancedReceiptOCR.shared.recognizeText(from: enhanced) { result in
                 if case .success(let text) = result {
-                    results.append(text)
-                    self.logger.log("Pass 2 (enhanced): \(text.count) chars", level: .success)
+                    continuation.resume(returning: text)
+                } else {
+                    continuation.resume(returning: nil)
                 }
-                group.leave()
             }
         }
+    }
+    
+    private func performInvertedOCR(_ image: UIImage) async -> String? {
+        // Use cached inverted image if available
+        guard let inverted = imageCache.getInverted(image) else {
+            return nil
+        }
         
-        // Pass 3: Inverted (white on black)
-        if let inverted = invertImage(image) {
-            group.enter()
+        return await withCheckedContinuation { continuation in
             EnhancedReceiptOCR.shared.recognizeText(from: inverted) { result in
                 if case .success(let text) = result {
-                    results.append(text)
-                    self.logger.log("Pass 3 (inverted): \(text.count) chars", level: .success)
+                    continuation.resume(returning: text)
+                } else {
+                    continuation.resume(returning: nil)
                 }
-                group.leave()
-            }
-        }
-        
-        group.notify(queue: .main) {
-            self.logger.log("Multi-pass complete: \(results.count) passes succeeded")
-            
-            if results.isEmpty {
-                completion(nil)
-            } else {
-                // Use longest result (usually has most text)
-                let best = results.max(by: { $0.count < $1.count })
-                self.logger.log("Selected best result: \(best?.count ?? 0) chars", level: .success)
-                completion(best)
             }
         }
     }
@@ -789,7 +988,7 @@ final class MultiPassOCRStrategy {
         case low, medium, high
     }
     
-    private func applyEnhancement(_ image: UIImage, level: EnhancementLevel) -> UIImage? {
+    func applyEnhancement(_ image: UIImage, level: EnhancementLevel) -> UIImage? {
         guard let ciImage = CIImage(image: image) else { return nil }
         
         let contrast: Float
@@ -821,7 +1020,7 @@ final class MultiPassOCRStrategy {
         return UIImage(cgImage: cgImage)
     }
     
-    private func invertImage(_ image: UIImage) -> UIImage? {
+    func invertImage(_ image: UIImage) -> UIImage? {
         guard let ciImage = CIImage(image: image) else { return nil }
         
         let filter = CIFilter(name: "CIColorInvert")!
@@ -1064,16 +1263,35 @@ final class ReceiptProcessingManager: NSObject, ObservableObject {
 final class ReceiptImagePreprocessor {
     static let shared = ReceiptImagePreprocessor()
     private let context = CIContext()
+    private let cache = ImagePreprocessingCache.shared
 
-    /// 🌈 Universal preprocessing for any receipt type
+    /// 🌈 Universal preprocessing for any receipt type (with caching)
     func preprocess(_ uiImage: UIImage, completion: @escaping (UIImage?) -> Void) {
         ReceiptDebugLogger.shared.logDebug("Starting enhanced image preprocessing")
         
-        // Step 1: Auto-crop receipt from background
-        let croppedImage = autoCropReceipt(from: uiImage)
+        // Check cache first
+        if let cached = cache.getPreprocessed(uiImage) {
+            ReceiptDebugLogger.shared.logSuccess("✅ Using cached preprocessed image")
+            completion(cached)
+            return
+        }
+        
+        // Step 1: Auto-crop receipt from background (with caching)
+        let croppedImage: UIImage
+        if let cached = cache.getCropped(uiImage) {
+            ReceiptDebugLogger.shared.logDebug("✅ Using cached cropped image")
+            croppedImage = cached
+        } else {
+            croppedImage = autoCropReceipt(from: uiImage)
+            cache.setCropped(uiImage, cropped: croppedImage)
+        }
         
         // Step 2: Apply enhanced preprocessing to cropped image
         let enhanced = preprocessSync(croppedImage)
+        
+        // Cache the final result
+        cache.setPreprocessed(uiImage, processed: enhanced)
+        
         completion(enhanced)
     }
     
