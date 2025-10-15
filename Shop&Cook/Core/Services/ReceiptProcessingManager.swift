@@ -665,8 +665,8 @@ final class EnhancedReceiptOCR {
         _ observations: [VNRecognizedTextObservation],
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        // USE SIMPLE EXTRACTION - Don't overcomplicate!
-        let extractedText = extractTextSimple(observations)
+        // USE ULTRA SIMPLE EXTRACTION - NO GROUPING AT ALL!
+        let extractedText = extractTextUltraSimple(observations)
         
         if extractedText.isEmpty {
             logger.log("No text recognized", level: .error)
@@ -677,59 +677,25 @@ final class EnhancedReceiptOCR {
         }
     }
     
-    // ✅ SIMPLE, WORKING EXTRACTION
-    private func extractTextSimple(_ observations: [VNRecognizedTextObservation]) -> String {
-        logger.log("Processing \(observations.count) observations")
+    // ✅ SIMPLEST POSSIBLE EXTRACTION - NO GROUPING AT ALL
+    private func extractTextUltraSimple(_ observations: [VNRecognizedTextObservation]) -> String {
+        logger.log("Processing \(observations.count) observations (ULTRA SIMPLE)")
         
-        // Sort by Y (top to bottom)
-        let sorted = observations.sorted { obs1, obs2 in
-            let y1 = obs1.boundingBox.midY
-            let y2 = obs2.boundingBox.midY
-            
-            // If roughly same Y, sort by X (left to right)
-            if abs(y1 - y2) < 0.02 {  // Within 2% height
-                return obs1.boundingBox.minX < obs2.boundingBox.minX
-            }
-            
-            return y1 > y2  // Higher Y = higher on screen
-        }
+        // Sort ONLY by Y (top to bottom)
+        // Don't try to group, don't try to be smart
+        let sorted = observations.sorted { $0.boundingBox.midY > $1.boundingBox.midY }
         
-        var lines: [String] = []
-        var currentLine: [String] = []
-        var lastY: CGFloat?
-        
-        for observation in sorted {
-            guard let text = observation.topCandidates(1).first?.string else { continue }
-            
-            let cleanText = text.trimmingCharacters(in: .whitespaces)
-            if cleanText.isEmpty { continue }
-            
-            let currentY = observation.boundingBox.midY
-            
-            // Check if same line (within 2% height difference)
-            if let lastY = lastY, abs(currentY - lastY) < 0.02 {
-                // Same line, append
-                currentLine.append(cleanText)
-            } else {
-                // New line
-                if !currentLine.isEmpty {
-                    lines.append(currentLine.joined(separator: " "))
-                }
-                currentLine = [cleanText]
-            }
-            
-            lastY = currentY
-        }
-        
-        // Add last line
-        if !currentLine.isEmpty {
-            lines.append(currentLine.joined(separator: " "))
+        // Extract each observation as its own line
+        let lines = sorted.compactMap { observation -> String? in
+            guard let text = observation.topCandidates(1).first?.string else { return nil }
+            let clean = text.trimmingCharacters(in: .whitespaces)
+            return clean.isEmpty ? nil : clean
         }
         
         logger.log("Extracted \(lines.count) lines")
         
-        // Debug first 10 lines
-        for (i, line) in lines.prefix(10).enumerated() {
+        // Debug: Show first 15 lines
+        for (i, line) in lines.prefix(15).enumerated() {
             logger.logTrace("[\(i)] \(line)")
         }
         
