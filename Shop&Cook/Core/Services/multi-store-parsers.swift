@@ -1275,7 +1275,65 @@ final class AldiParser: BaseReceiptParser, StoreReceiptParser {
                 continue
             }
             
-            // Pattern 1: Article number line (6 digits only)
+            // ✅ NEW PATTERN: Single line with article number + product name + quantity
+            // Format: "203120 Mineralwasser 6x11" or "505329 Flor. Flammkuböden"
+            if let match = line.range(of: #"^(\d{6})\s+(.+?)(?:\s+(\d+x\d+))?\s*$"#, options: .regularExpression) {
+                let fullMatch = String(line[match])
+                let components = fullMatch.components(separatedBy: .whitespaces)
+                
+                if components.count >= 2 {
+                    let articleNumber = components[0]
+                    var productName = components[1...].joined(separator: " ")
+                    
+                    // Extract quantity if present (e.g., "6x11")
+                    var quantity: String?
+                    if let qtyMatch = productName.range(of: #"\d+x\d+"#, options: .regularExpression) {
+                        quantity = String(productName[qtyMatch])
+                        productName = productName.replacingOccurrences(of: quantity!, with: "").trimmingCharacters(in: .whitespaces)
+                    }
+                    
+                    // Look for price in next few lines
+                    var price: Double = 0.0
+                    for j in (i + 1)...(min(i + 3, lines.count - 1)) {
+                        let priceLine = lines[j].trimmingCharacters(in: .whitespaces)
+                        
+                        // Price pattern: "2,50" or "0,69 A" or "2,50 B"
+                        if let priceMatch = priceLine.range(of: #"^\d{1,3}[.,]\d{2}\s*[AB]?$"#, options: .regularExpression) {
+                            if let priceStr = priceLine.range(of: #"\d{1,3}[.,]\d{2}"#, options: .regularExpression) {
+                                price = parsePrice(String(priceLine[priceStr]))
+                                break
+                            }
+                        }
+                    }
+                    
+                    if price > 0 {
+                        // Add quantity to product name if present
+                        if let qty = quantity {
+                            productName += " (\(qty))"
+                        }
+                        
+                        productName = cleanProductName(productName)
+                        
+                        if isFoodItem(productName) {
+                            let category = categorize(productName)
+                            products.append(ParsedProduct(
+                                rawLine: line,
+                                name: productName,
+                                price: price,
+                                section: category
+                            ))
+                            
+                            logger.logDebug("✓ \(productName) - €\(String(format: "%.2f", price))")
+                        }
+                        
+                        // Skip to line after price
+                        i += 2
+                        continue
+                    }
+                }
+            }
+            
+            // Pattern 2: Article number line (6 digits only) - OLD FORMAT
             // Next line should have product name
             // Line after that should have price
             if line.range(of: #"^\d{6}$"#, options: .regularExpression) != nil {

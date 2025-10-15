@@ -665,16 +665,75 @@ final class EnhancedReceiptOCR {
         _ observations: [VNRecognizedTextObservation],
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        // CRITICAL: Use column-aware extraction for better accuracy
-        // This preserves the receipt structure (description | price)
-        let extractedText = extractTextWithColumnAwareness(observations)
+        // USE SIMPLE EXTRACTION - Don't overcomplicate!
+        let extractedText = extractTextSimple(observations)
         
         if extractedText.isEmpty {
             logger.log("No text recognized", level: .error)
             completion(.failure(OCRError.noText))
         } else {
+            logger.log("✅ Extracted \(extractedText.split(separator: "\n").count) lines")
             completion(.success(extractedText))
         }
+    }
+    
+    // ✅ SIMPLE, WORKING EXTRACTION
+    private func extractTextSimple(_ observations: [VNRecognizedTextObservation]) -> String {
+        logger.log("Processing \(observations.count) observations")
+        
+        // Sort by Y (top to bottom)
+        let sorted = observations.sorted { obs1, obs2 in
+            let y1 = obs1.boundingBox.midY
+            let y2 = obs2.boundingBox.midY
+            
+            // If roughly same Y, sort by X (left to right)
+            if abs(y1 - y2) < 0.02 {  // Within 2% height
+                return obs1.boundingBox.minX < obs2.boundingBox.minX
+            }
+            
+            return y1 > y2  // Higher Y = higher on screen
+        }
+        
+        var lines: [String] = []
+        var currentLine: [String] = []
+        var lastY: CGFloat?
+        
+        for observation in sorted {
+            guard let text = observation.topCandidates(1).first?.string else { continue }
+            
+            let cleanText = text.trimmingCharacters(in: .whitespaces)
+            if cleanText.isEmpty { continue }
+            
+            let currentY = observation.boundingBox.midY
+            
+            // Check if same line (within 2% height difference)
+            if let lastY = lastY, abs(currentY - lastY) < 0.02 {
+                // Same line, append
+                currentLine.append(cleanText)
+            } else {
+                // New line
+                if !currentLine.isEmpty {
+                    lines.append(currentLine.joined(separator: " "))
+                }
+                currentLine = [cleanText]
+            }
+            
+            lastY = currentY
+        }
+        
+        // Add last line
+        if !currentLine.isEmpty {
+            lines.append(currentLine.joined(separator: " "))
+        }
+        
+        logger.log("Extracted \(lines.count) lines")
+        
+        // Debug first 10 lines
+        for (i, line) in lines.prefix(10).enumerated() {
+            logger.logTrace("[\(i)] \(line)")
+        }
+        
+        return lines.joined(separator: "\n")
     }
     
     private func averageConfidence(_ lines: [(text: String, confidence: Float, box: CGRect)]) -> Float {
