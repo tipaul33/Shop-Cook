@@ -452,66 +452,116 @@ struct StoreMatch {
     let reasoning: [String: Float]  // Factor scores
 }
 
-/// Smart store detector using multi-factor analysis
+/// Store types for fuzzy detection
+enum StoreType {
+    case aldiSued
+    case aldiNord
+    case lidl
+    case rewe
+    case edeka
+    case unknown
+}
+
+/// Simple store match for fuzzy detection
+struct SimpleStoreMatch {
+    let store: StoreType
+    let confidence: Float
+}
+
+/// ✅ FUZZY STORE DETECTION
 class SmartStoreDetector {
-    private let parsers: [StoreReceiptParser]
     private let logger = ReceiptDebugLogger.shared
     
-    init(parsers: [StoreReceiptParser]) {
-        self.parsers = parsers
-    }
-    
-    /// Detect store using multiple factors
     func detect(from text: String) -> StoreMatch? {
-        logger.section("INTELLIGENT STORE DETECTION")
-        logger.log("Analyzing text with \(parsers.count) store signatures")
+        logger.section("FUZZY STORE DETECTION")
         
-        let lines = text.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        let normalized = text.uppercased()
+            .replacingOccurrences(of: "Ü", with: "U")
+            .replacingOccurrences(of: "Ö", with: "O")
+            .replacingOccurrences(of: "Ä", with: "A")
         
-        var matches: [StoreMatch] = []
+        // Check each store type
+        var scores: [StoreType: Float] = [:]
         
-        for parser in parsers {
-            // Calculate multi-factor score
-            let nameScore = detectByName(text, storeName: parser.storeName) * 0.50
-            let structureScore = detectByStructure(lines, storeName: parser.storeName) * 0.30
-            let patternScore = detectByPatterns(lines, storeName: parser.storeName) * 0.20
+        // ALDI detection
+        if normalized.contains("ALDI") {
+            var score: Float = 0.8  // Base score for name match
             
-            let totalScore = nameScore + structureScore + patternScore
-            
-            if totalScore > 0.3 {  // Minimum confidence threshold
-                let match = StoreMatch(
-                    storeName: parser.storeName,
-                    parser: parser,
-                    confidence: totalScore,
-                    reasoning: [
-                        "name": nameScore,
-                        "structure": structureScore,
-                        "pattern": patternScore
-                    ]
-                )
-                matches.append(match)
-                
-                logger.logDebug("\(parser.storeName): score=\(String(format: "%.2f", totalScore)) (name:\(String(format: "%.2f", nameScore)), struct:\(String(format: "%.2f", structureScore)), pattern:\(String(format: "%.2f", patternScore)))")
+            if normalized.contains("SUD") || normalized.contains("SUED") {
+                score = 0.95
+            } else if normalized.contains("NORD") {
+                score = 0.95
             }
+            
+            // Boost score if we see article number pattern
+            if hasAldiArticleNumbers(text) {
+                score = min(1.0, score + 0.1)
+            }
+            
+            scores[.aldiSued] = score
         }
         
-        // Return best match
-        guard let bestMatch = matches.max(by: { $0.confidence < $1.confidence }) else {
-            logger.logWarning("No store matched with sufficient confidence")
+        // LIDL detection
+        if normalized.contains("LIDL") {
+            scores[.lidl] = 0.9
+        }
+        
+        // REWE detection
+        if normalized.contains("REWE") {
+            scores[.rewe] = 0.9
+        }
+        
+        // EDEKA detection
+        if normalized.contains("EDEKA") {
+            scores[.edeka] = 0.9
+        }
+        
+        // Find best match
+        guard let best = scores.max(by: { $0.value < $1.value }),
+              best.value >= 0.5 else {  // Lower threshold!
+            logger.logWarning("No store detected with sufficient confidence")
             return nil
         }
         
-        logger.logSuccess("Best match: \(bestMatch.storeName) with confidence \(String(format: "%.1f%%", bestMatch.confidence * 100))")
-        return bestMatch
+        // Convert StoreType to parser
+        let parser = getParserForStoreType(best.key)
+        
+        logger.logSuccess("Detected: \(best.key) with confidence \(String(format: "%.1f%%", best.value * 100))")
+        
+        return StoreMatch(
+            storeName: parser.storeName,
+            parser: parser,
+            confidence: best.value,
+            reasoning: ["fuzzy_detection": best.value]
+        )
     }
     
-    // MARK: - Detection Factors
+    private func hasAldiArticleNumbers(_ text: String) -> Bool {
+        let pattern = try! NSRegularExpression(pattern: #"\b\d{6}\b"#)
+        let matches = pattern.matches(in: text, range: NSRange(text.startIndex..., in: text))
+        return matches.count >= 3
+    }
     
-    /// Factor 1: Name matching (50% weight)
-    private func detectByName(_ text: String, storeName: String) -> Float {
-        let upper = text.uppercased()
+    private func getParserForStoreType(_ storeType: StoreType) -> StoreReceiptParser {
+        switch storeType {
+        case .aldiSued, .aldiNord:
+            return AldiParser()
+        case .lidl:
+            return LidlParser()
+        case .rewe:
+            return ReweParser()
+        case .edeka:
+            return EdekaParser()
+        case .unknown:
+            return GenericReceiptParser()
+        }
+    }
+}
+
+// MARK: - Parser Factory
+
+final class ReceiptParserFactory {
+    static let shared = ReceiptParserFactory()
         
         // Store-specific name patterns with OCR error tolerance
         let storePatterns: [String: [String]] = [
@@ -1117,37 +1167,31 @@ final class AldiParser: BaseReceiptParser, StoreReceiptParser {
     func canParse(_ text: String) -> Bool {
         let upper = text.uppercased()
         
-        let hasAldi = upper.contains("ALDI") || 
-                     upper.contains("ALDT") ||
-                     upper.contains("ALDO") ||
-                     upper.contains("ALD1")
+        // Check for ALDI name
+        let hasAldi = upper.contains("ALDI") || upper.contains("ALDT")
+        let hasSud = upper.contains("SUD") || upper.contains("SÜD") || upper.contains("SUED")
         
-        let hasSud = upper.contains("SÜD") || 
-                     upper.contains("SUED") || 
-                     upper.contains("SUD") ||
-                     upper.contains("SÚD") ||
-                     upper.contains("SÛD") ||
-                     upper.contains("S00D") ||
-                     upper.contains("SOOD") ||
-                     upper.contains("SOD")
+        if hasAldi && hasSud {
+            logger.log("✅ Detected ALDI SÜD", level: .success)
+            return true
+        }
         
-        let hasNord = upper.contains("NORD") ||
-                      upper.contains("N0RD") ||
-                      upper.contains("NORO")
+        // Fallback: Check article number pattern
+        let lines = text.components(separatedBy: .newlines)
+        let articleNumbers = lines.filter { 
+            $0.range(of: #"^\d{6}\s"#, options: .regularExpression) != nil 
+        }
         
-        return hasAldi && (hasSud || hasNord)
+        if articleNumbers.count >= 3 {
+            logger.log("✅ Detected ALDI via article numbers", level: .success)
+            return true
+        }
+        
+        return false
     }
     
     func parse(from text: String) -> ParsedReceipt? {
-        logger.section("ALDI PARSER V2 - STRICT MODE")
-        
-        // Determine store variant
-        let upper = text.uppercased()
-        let detectedStoreName = (upper.contains("SÜD") || upper.contains("SUED") || upper.contains("SUD")) 
-            ? "ALDI Süd" 
-            : "ALDI Nord"
-        
-        logger.log("Detected store: \(detectedStoreName)")
+        logger.section("ALDI PARSER - IMPROVED")
         
         let lines = text.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -1155,40 +1199,66 @@ final class AldiParser: BaseReceiptParser, StoreReceiptParser {
         
         logger.log("Processing \(lines.count) lines")
         
-        // Debug: Print all lines to understand structure
-        if lines.count < 50 {
-            for (i, line) in lines.enumerated() {
-                logger.logTrace("[\(i)] \(line)")
+        // Find store name
+        let storeName = lines.first(where: { 
+            $0.uppercased().contains("ALDI") 
+        }) ?? "ALDI SÜD"
+        
+        // Date extraction
+        let date = extractDate(from: lines)
+        
+        // Find products (lines starting with 6-digit article number)
+        var products: [ParsedProduct] = []
+        
+        for i in 0..<lines.count {
+            let line = lines[i]
+            
+            // Pattern: "605084 Cremeölseife" or similar
+            guard let regex = try? NSRegularExpression(pattern: #"^(\d{6})\s+(.+)$"#),
+                  let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+                  let articleRange = Range(match.range(at: 1), in: line),
+                  let nameRange = Range(match.range(at: 2), in: line) else {
+                continue
+            }
+            
+            let articleNumber = String(line[articleRange])
+            var productName = String(line[nameRange]).trimmingCharacters(in: .whitespaces)
+            
+            // Clean product name
+            productName = cleanProductName(productName)
+            
+            // Look for price in next few lines
+            var price: Double = 0.0
+            
+            for j in (i+1)...(min(i+3, lines.count-1)) {
+                let nextLine = lines[j]
+                
+                // Price pattern: "1,29" or "12,99"
+                if let priceMatch = nextLine.range(of: #"\d{1,3}[,.]\d{2}"#, options: .regularExpression) {
+                    let priceStr = String(nextLine[priceMatch])
+                    price = parsePrice(priceStr)
+                    break
+                }
+            }
+            
+            if price > 0 {
+                let section = ProductClassifier.shared.guessSection(for: productName)
+                
+                products.append(ParsedProduct(
+                    rawLine: line,
+                    name: productName,
+                    price: price,
+                    section: section
+                ))
+                
+                logger.logDebug("✓ \(productName) - €\(String(format: "%.2f", price))")
             }
         }
         
-        // Date extraction
-        let date = extractDate(from: lines, formats: ["dd.MM.yyyy HH:mm", "dd.MM.yy HH:mm"])
-        
-        // Find product section boundaries
-        guard let (startIdx, endIdx) = findProductBounds(in: lines) else {
-            logger.logError("Could not find product section")
-            return nil
-        }
-        
-        logger.log("Product section: lines \(startIdx) to \(endIdx)")
-        
-        // Extract products
-        let productLines = Array(lines[startIdx..<endIdx])
-        let products = parseProductLines(productLines)
-        
-        logger.logSuccess("Parsed \(products.count) products")
-        
         // Extract total
-        var total = extractTotalAmount(from: lines, afterLine: endIdx)
+        let total = extractTotal(from: lines)
         
-        // If no total found, calculate from products
-        if total == 0.0 {
-            total = products.map { $0.price }.reduce(0, +)
-            logger.logWarning("No total found, calculated: €\(String(format: "%.2f", total))")
-        } else {
-            logger.logSuccess("Total: €\(String(format: "%.2f", total))")
-        }
+        logger.logSuccess("Parsed \(products.count) products, total: €\(String(format: "%.2f", total))")
         
         guard !products.isEmpty else {
             logger.logError("No products found")
@@ -1196,350 +1266,68 @@ final class AldiParser: BaseReceiptParser, StoreReceiptParser {
         }
         
         return ParsedReceipt(
-            storeName: detectedStoreName,
+            storeName: storeName,
             date: date,
             total: total,
             products: products
         )
     }
     
-    // MARK: - Find Product Boundaries
-    
-    private func findProductBounds(in lines: [String]) -> (Int, Int)? {
-        var startIdx: Int?
-        var endIdx: Int?
-        
-        // Strategy: Find first line that looks like a product
-        // Product patterns in Aldi receipts:
-        // 1. "Eigenmarke: Pfand" followed by price on next line
-        // 2. "605084" (6-digit article number) followed by description
-        // 3. Price lines: "2,50 B" or "0,69 A"
-        
-        for (i, line) in lines.enumerated() {
-            // Skip header lines
-            if line.uppercased().contains("ALDI") || 
-               line.uppercased().contains("HERTZSTR") ||
-               line.uppercased().contains("RHEINSTETTEN") ||
-               line.contains("76287") {
-                continue
-            }
-            
-            // Look for first article number (6 digits)
-            if line.range(of: #"^\d{6}$"#, options: .regularExpression) != nil {
-                startIdx = i
-                logger.log("Product section starts at line \(i): \(line)")
-                break
-            }
-            
-            // Or look for "Eigenmarke:"
-            if line.contains("Eigenmarke:") {
-                startIdx = i
-                logger.log("Product section starts at line \(i): \(line)")
-                break
+    private func extractDate(from lines: [String]) -> Date {
+        // Look for pattern: "09.10.2025" or "09.10.25"
+        for line in lines {
+            if let match = line.range(of: #"\d{2}\.\d{2}\.\d{2,4}"#, options: .regularExpression) {
+                let dateStr = String(line[match])
+                
+                let formatter = DateFormatter()
+                formatter.dateFormat = dateStr.count > 8 ? "dd.MM.yyyy" : "dd.MM.yy"
+                
+                if let date = formatter.date(from: dateStr) {
+                    return date
+                }
             }
         }
-        
-        guard let start = startIdx else {
-            logger.logError("Could not find product section start")
-            return nil
-        }
-        
-        // Find end: line containing section markers
-        for i in (start + 1)..<lines.count {
-            let line = lines[i].uppercased()
-            if line.contains("K-U-N-D-E") ||
-               line.contains("KARTENZAHLUNG") ||
-               line.contains("SUMME") ||
-               (line.contains("BETRAG") && !line.contains("PFAND")) {
-                endIdx = i
-                logger.log("Product section ends at line \(i): \(lines[i])")
-                break
-            }
-        }
-        
-        return (start, endIdx ?? lines.count)
+        return Date()
     }
     
-    // MARK: - Parse Product Lines
-    
-    private func parseProductLines(_ lines: [String]) -> [ParsedProduct] {
-        var products: [ParsedProduct] = []
-        var i = 0
-        
-        while i < lines.count {
-            let line = lines[i].trimmingCharacters(in: .whitespaces)
-            
-            // Skip empty lines
-            guard !line.isEmpty else {
-                i += 1
-                continue
-            }
-            
-            // ✅ NEW PATTERN: Single line with article number + product name + quantity
-            // Format: "203120 Mineralwasser 6x11" or "505329 Flor. Flammkuböden"
-            if let match = line.range(of: #"^(\d{6})\s+(.+?)(?:\s+(\d+x\d+))?\s*$"#, options: .regularExpression) {
-                let fullMatch = String(line[match])
-                let components = fullMatch.components(separatedBy: .whitespaces)
-                
-                if components.count >= 2 {
-                    let articleNumber = components[0]
-                    var productName = components[1...].joined(separator: " ")
-                    
-                    // Extract quantity if present (e.g., "6x11")
-                    var quantity: String?
-                    if let qtyMatch = productName.range(of: #"\d+x\d+"#, options: .regularExpression) {
-                        quantity = String(productName[qtyMatch])
-                        productName = productName.replacingOccurrences(of: quantity!, with: "").trimmingCharacters(in: .whitespaces)
-                    }
-                    
-                    // Look for price in next few lines
-                    var price: Double = 0.0
-                    for j in (i + 1)...(min(i + 3, lines.count - 1)) {
-                        let priceLine = lines[j].trimmingCharacters(in: .whitespaces)
-                        
-                        // Price pattern: "2,50" or "0,69 A" or "2,50 B"
-                        if let priceMatch = priceLine.range(of: #"^\d{1,3}[.,]\d{2}\s*[AB]?$"#, options: .regularExpression) {
-                            if let priceStr = priceLine.range(of: #"\d{1,3}[.,]\d{2}"#, options: .regularExpression) {
-                                price = parsePrice(String(priceLine[priceStr]))
-                                break
-                            }
-                        }
-                    }
-                    
-                    if price > 0 {
-                        // Add quantity to product name if present
-                        if let qty = quantity {
-                            productName += " (\(qty))"
-                        }
-                        
-                        productName = cleanProductName(productName)
-                        
-                        if isFoodItem(productName) {
-                            let category = categorize(productName)
-                            products.append(ParsedProduct(
-                                rawLine: line,
-                                name: productName,
-                                price: price,
-                                section: category
-                            ))
-                            
-                            logger.logDebug("✓ \(productName) - €\(String(format: "%.2f", price))")
-                        }
-                        
-                        // Skip to line after price
-                        i += 2
-                        continue
-                    }
-                }
-            }
-            
-            // Pattern 2: Article number line (6 digits only) - OLD FORMAT
-            // Next line should have product name
-            // Line after that should have price
-            if line.range(of: #"^\d{6}$"#, options: .regularExpression) != nil {
-                let articleNumber = line
-                
-                // Look ahead for product name and price
-                if i + 1 < lines.count {
-                    let nameLine = lines[i + 1].trimmingCharacters(in: .whitespaces)
-                    
-                    // Try to find price in next 3 lines
-                    var priceLine: String?
-                    var priceLineIndex: Int?
-                    
-                    for j in (i + 2)...(min(i + 4, lines.count - 1)) {
-                        let testLine = lines[j].trimmingCharacters(in: .whitespaces)
-                        
-                        // Price pattern: "2,50 B" or "0,69 A" or just "2,50"
-                        if testLine.range(of: #"^\d{1,3}[.,]\d{2}\s*[AB]?$"#, options: .regularExpression) != nil {
-                            priceLine = testLine
-                            priceLineIndex = j
-                            break
-                        }
-                    }
-                    
-                    if let priceLine = priceLine, let priceIdx = priceLineIndex {
-                        // Extract price
-                        if let priceMatch = priceLine.range(of: #"\d{1,3}[.,]\d{2}"#, options: .regularExpression) {
-                            let price = parsePrice(String(priceLine[priceMatch]))
-                            
-                            var productName = nameLine
-                            
-                            // Check if there's quantity info between name and price
-                            if priceIdx > i + 2 {
-                                // Lines between name and price might contain quantity info
-                                for k in (i + 2)..<priceIdx {
-                                    let infoLine = lines[k].trimmingCharacters(in: .whitespaces)
-                                    
-                                    // Quantity pattern: "10 x" or "6 x"
-                                    if let qtyMatch = infoLine.range(of: #"^(\d+)\s+x$"#, options: .regularExpression) {
-                                        let qtyStr = String(infoLine[qtyMatch]).replacingOccurrences(of: " x", with: "")
-                                        if let qty = Int(qtyStr), qty > 1 {
-                                            productName += " (\(qty)x)"
-                                        }
-                                    }
-                                    
-                                    // Weight pattern: "0,634 kg x" or "0.99 EUR/kg"
-                                    if infoLine.contains("kg") || infoLine.contains("EUR/kg") {
-                                        // Add weight info to name
-                                        productName += " \(infoLine)"
-                                    }
-                                }
-                            }
-                            
-                            // Clean and validate
-                            productName = cleanProductName(productName)
-                            
-                            if isFoodItem(productName) && price > 0 {
-                                let category = categorize(productName)
-                                products.append(ParsedProduct(
-                                    rawLine: "\(articleNumber) \(nameLine)",
-                                    name: productName,
-                                    price: price,
-                                    section: category
-                                ))
-                                
-                                logger.logDebug("✓ \(productName) - €\(String(format: "%.2f", price))")
-                            }
-                            
-                            // Skip to line after price
-                            i = priceIdx + 1
-                            continue
-                        }
-                    }
-                }
-                
-                i += 1
-                continue
-            }
-            
-            // Pattern 2: Line starting with "Eigenmarke:"
-            if line.contains("Eigenmarke:") {
-                let name = line.replacingOccurrences(of: "Eigenmarke:", with: "").trimmingCharacters(in: .whitespaces)
-                
-                // Price should be in next line or two
-                for j in (i + 1)...(min(i + 3, lines.count - 1)) {
-                    let testLine = lines[j].trimmingCharacters(in: .whitespaces)
-                    
-                    if testLine.range(of: #"^\d{1,3}[.,]\d{2}\s*[AB]?$"#, options: .regularExpression) != nil {
-                        if let priceMatch = testLine.range(of: #"\d{1,3}[.,]\d{2}"#, options: .regularExpression) {
-                            let price = parsePrice(String(testLine[priceMatch]))
-                            
-                            if isFoodItem(name) && price > 0 {
-                                let category = categorize(name)
-                                products.append(ParsedProduct(
-                                    rawLine: line,
-                                    name: cleanProductName(name),
-                                    price: price,
-                                    section: category
-                                ))
-                                
-                                logger.logDebug("✓ \(name) - €\(String(format: "%.2f", price))")
-                            }
-                            
-                            i = j + 1
-                            break
-                        }
-                    }
-                }
-                
-                i += 1
-                continue
-            }
-            
-            // Pattern 3: Product name with embedded price
-            // "Bio Apfelmus 360g 0,69 A"
-            if let priceMatch = line.range(of: #"\d{1,3}[.,]\d{2}\s*[AB]?\s*$"#, options: .regularExpression) {
-                let price = parsePrice(String(line[priceMatch]))
-                let name = String(line[..<priceMatch.lowerBound])
-                    .replacingOccurrences(of: #"\s*[AB]?\s*$"#, with: "", options: .regularExpression)
-                    .trimmingCharacters(in: .whitespaces)
-                
-                if isFoodItem(name) && price > 0 {
-                    let category = categorize(name)
-                    products.append(ParsedProduct(
-                        rawLine: line,
-                        name: cleanProductName(name),
-                        price: price,
-                        section: category
-                    ))
-                    
-                    logger.logDebug("✓ \(name) - €\(String(format: "%.2f", price))")
-                }
-            }
-            
-            i += 1
-        }
-        
-        return products
-    }
-    
-    // MARK: - Extract Total
-    
-    private func extractTotalAmount(from lines: [String], afterLine: Int) -> Double {
-        // Search around the "Betrag" or "Summe" keyword
-        for i in max(0, afterLine - 10)..<min(lines.count, afterLine + 20) {
+    private func extractTotal(from lines: [String]) -> Double {
+        // Look for "Betrag" keyword
+        for i in 0..<lines.count {
             let line = lines[i]
             
             if line.uppercased().contains("BETRAG") {
-                // Try to find price in same line
-                if let match = line.range(of: #"\d{1,3}[.,]\d{2}"#, options: .regularExpression) {
-                    let price = parsePrice(String(line[match]))
-                    logger.log("Total found (Betrag): €\(String(format: "%.2f", price))")
-                    return price
-                }
-                
-                // Try next few lines
-                for j in (i + 1)...(min(i + 5, lines.count - 1)) {
+                // Check next few lines for price
+                for j in (i+1)...(min(i+5, lines.count-1)) {
                     let nextLine = lines[j]
                     
-                    // Look for pattern like "67,78 EUR"
-                    if let match = nextLine.range(of: #"\d{1,3}[.,]\d{2}\s*EUR"#, options: .regularExpression) {
-                        let priceStr = String(nextLine[match]).replacingOccurrences(of: "EUR", with: "").trimmingCharacters(in: .whitespaces)
-                        let price = parsePrice(priceStr)
-                        logger.log("Total found (next line): €\(String(format: "%.2f", price))")
-                        return price
+                    if let match = nextLine.range(of: #"\d{1,3}[,.]\d{2}"#, options: .regularExpression) {
+                        return parsePrice(String(nextLine[match]))
                     }
                 }
             }
-            
-            // Also check footer "Summe" line
-            if line.uppercased().contains("SUMME") && line.uppercased().contains("EUR") {
-                if let match = line.range(of: #"\d{1,3}[.,]\d{2}"#, options: .regularExpression) {
-                    let price = parsePrice(String(line[match]))
-                    logger.log("Total found (Summe): €\(String(format: "%.2f", price))")
-                    return price
-                }
-            }
         }
-        
         return 0.0
     }
     
-    // MARK: - Categorize Products
+    private func parsePrice(_ str: String) -> Double {
+        let normalized = str.replacingOccurrences(of: ",", with: ".")
+        return Double(normalized) ?? 0.0
+    }
     
-    private func categorize(_ name: String) -> ProductSection {
-        let lower = name.lowercased()
+    private func cleanProductName(_ name: String) -> String {
+        var cleaned = name
         
-        if lower.contains("pfand") { return .unknown }
+        // Remove weight/size indicators
+        cleaned = cleaned.replacingOccurrences(
+            of: #"\d+\s*(g|kg|ml|l|x)\b"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
         
-        // Fridge
-        if lower.contains("milch") || lower.contains("joghurt") || lower.contains("yogurt") ||
-            lower.contains("käse") || lower.contains("butter") || lower.contains("quark") ||
-            lower.contains("sahne") || lower.contains("rahm") || lower.contains("creme") ||
-            lower.contains("hähnchen") || lower.contains("fleisch") || lower.contains("wurst") ||
-            lower.contains("schinken") || lower.contains("lachs") || lower.contains("ei") {
-            return .fridge
-        }
+        // Remove extra spaces
+        cleaned = cleaned.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
         
-        // Freezer
-        if lower.contains("eis") || lower.contains("tiefkühl") || lower.contains("tk ") ||
-           lower.contains("frozen") || lower.contains("pizza") && lower.contains("tiefkühl") {
-            return .freezer
-        }
-        
-        // Pantry (dry goods + fruits/vegetables)
-        return .pantry
+        return cleaned.trimmingCharacters(in: .whitespaces)
     }
 }
 
