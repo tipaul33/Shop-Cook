@@ -275,7 +275,14 @@ final class EnhancedReceiptOCR {
                 return
             }
             
-            self.processObservations(observations, completion: completion)
+            // ✅ USE ULTRA SIMPLE EXTRACTION DIRECTLY
+            let text = self.extractTextUltraSimple(observations)
+            
+            if text.isEmpty {
+                completion(.failure(OCRError.noText))
+            } else {
+                completion(.success(text))
+            }
         }
         
         // CRITICAL SETTINGS FOR RECEIPT OCR
