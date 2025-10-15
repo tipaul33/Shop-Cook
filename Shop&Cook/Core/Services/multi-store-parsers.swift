@@ -10,7 +10,7 @@ import UIKit
 /// Main receipt parser protocol
 protocol ReceiptParser {
     var patterns: ReceiptPatterns { get }
-    func parse(_ text: String) -> ParsedReceipt?
+    func parse(from text: String) -> ParsedReceipt?
 }
 
 /// Store-specific patterns configuration
