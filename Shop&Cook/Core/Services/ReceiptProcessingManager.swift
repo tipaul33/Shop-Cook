@@ -1146,8 +1146,11 @@ final class ReceiptImagePreprocessor {
     // MARK: - Receipt Detection and Cropping
     
     /// Automatically detects and crops the receipt from the background
+    // MARK: - Improved Document Detection & Cropping
+    
+    /// Auto-crop receipt using Vision's built-in document detection
     private func autoCropReceipt(from image: UIImage) -> UIImage {
-        ReceiptDebugLogger.shared.logDebug("Starting automatic receipt cropping")
+        ReceiptDebugLogger.shared.logDebug("Starting automatic receipt cropping with Vision Document Detection")
         ReceiptDebugLogger.shared.logDebug("Original image size: \(image.size)")
         
         guard let ciImage = CIImage(image: image) else {
@@ -1155,43 +1158,185 @@ final class ReceiptImagePreprocessor {
             return image
         }
         
-        // Method 1: Try edge detection + contour analysis
-        ReceiptDebugLogger.shared.logDebug("Trying edge detection method...")
-        if let croppedRect = detectReceiptWithEdges(ciImage) {
-            ReceiptDebugLogger.shared.logSuccess("Receipt detected with edge detection: \(croppedRect)")
-            return cropImage(image, to: croppedRect)
+        // Method 1: Use VNDetectDocumentSegmentationRequest (iOS 15+, most reliable)
+        if #available(iOS 15.0, *) {
+            ReceiptDebugLogger.shared.logDebug("Trying VNDetectDocumentSegmentationRequest...")
+            if let croppedImage = detectReceiptWithDocumentSegmentation(ciImage, originalImage: image) {
+                ReceiptDebugLogger.shared.logSuccess("Receipt detected with document segmentation")
+                return croppedImage
+            }
         }
         
-        // Method 2: Try color-based segmentation
-        ReceiptDebugLogger.shared.logDebug("Trying color segmentation method...")
-        if let croppedRect = detectReceiptWithColorSegmentation(ciImage) {
-            ReceiptDebugLogger.shared.logSuccess("Receipt detected with color segmentation: \(croppedRect)")
-            return cropImage(image, to: croppedRect)
+        // Method 2: Use VNDetectRectanglesRequest for receipt edges with perspective correction
+        ReceiptDebugLogger.shared.logDebug("Trying VNDetectRectanglesRequest...")
+        if let croppedImage = detectReceiptWithRectangleDetection(ciImage, originalImage: image) {
+            ReceiptDebugLogger.shared.logSuccess("Receipt detected with rectangle detection")
+            return croppedImage
         }
         
-        // Method 3: Try text-based detection
-        ReceiptDebugLogger.shared.logDebug("Trying text detection method...")
+        // Method 3: Fallback to text-based detection
+        ReceiptDebugLogger.shared.logDebug("Falling back to text-based detection...")
         if let croppedRect = detectReceiptWithTextDetection(ciImage) {
             ReceiptDebugLogger.shared.logSuccess("Receipt detected with text detection: \(croppedRect)")
             return cropImage(image, to: croppedRect)
         }
         
-        // Method 4: Try adaptive cropping based on image analysis
-        ReceiptDebugLogger.shared.logDebug("Trying adaptive analysis method...")
-        if let croppedRect = detectReceiptWithAdaptiveAnalysis(ciImage) {
-            ReceiptDebugLogger.shared.logSuccess("Receipt detected with adaptive analysis: \(croppedRect)")
-            return cropImage(image, to: croppedRect)
-        }
-        
-        // Method 5: Try smart center cropping (for cases where receipt is centered)
-        ReceiptDebugLogger.shared.logDebug("Trying smart center cropping method...")
-        if let croppedRect = detectReceiptWithSmartCropping(ciImage) {
-            ReceiptDebugLogger.shared.logSuccess("Receipt detected with smart cropping: \(croppedRect)")
-            return cropImage(image, to: croppedRect)
-        }
-        
         ReceiptDebugLogger.shared.logWarning("All cropping methods failed, using full image")
         return image
+    }
+    
+    /// Detect receipt using VNDetectDocumentSegmentationRequest (iOS 15+)
+    @available(iOS 15.0, *)
+    private func detectReceiptWithDocumentSegmentation(_ ciImage: CIImage, originalImage: UIImage) -> UIImage? {
+        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+            return nil
+        }
+        
+        let request = VNDetectDocumentSegmentationRequest()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        
+        do {
+            try handler.perform([request])
+            
+            guard let observation = request.results?.first else {
+                ReceiptDebugLogger.shared.logDebug("No document segmentation found")
+                return nil
+            }
+            
+            // Vision found the document!
+            let normalizedRect = observation.boundingBox
+            let cropRect = VNImageRectForNormalizedRect(
+                normalizedRect,
+                Int(originalImage.size.width),
+                Int(originalImage.size.height)
+            )
+            
+            ReceiptDebugLogger.shared.logSuccess("Document detected at: \(cropRect)")
+            return cropImage(originalImage, to: cropRect)
+            
+        } catch {
+            ReceiptDebugLogger.shared.logError("Document segmentation failed: \(error)")
+            return nil
+        }
+    }
+    
+    /// Detect receipt using VNDetectRectanglesRequest with perspective correction
+    private func detectReceiptWithRectangleDetection(_ ciImage: CIImage, originalImage: UIImage) -> UIImage? {
+        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+            return nil
+        }
+        
+        let rectangleRequest = VNDetectRectanglesRequest()
+        
+        // Configure for receipt detection
+        rectangleRequest.minimumAspectRatio = 0.3  // Receipts are tall/narrow
+        rectangleRequest.maximumAspectRatio = 0.8  // But not too narrow
+        rectangleRequest.minimumConfidence = 0.6   // Moderate confidence
+        rectangleRequest.minimumSize = 0.2         // At least 20% of image
+        rectangleRequest.maximumObservations = 5   // Check top 5 rectangles
+        
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        
+        do {
+            try handler.perform([rectangleRequest])
+            
+            guard let observations = rectangleRequest.results, !observations.isEmpty else {
+                ReceiptDebugLogger.shared.logDebug("No rectangles detected")
+                return nil
+            }
+            
+            // Find best rectangle (highest confidence + good aspect ratio)
+            var bestObservation: VNRectangleObservation?
+            var bestScore: Float = 0.0
+            
+            for observation in observations {
+                let aspectRatio = observation.boundingBox.width / observation.boundingBox.height
+                let aspectScore: Float = (aspectRatio >= 0.3 && aspectRatio <= 0.8) ? 1.0 : 0.5
+                let score = observation.confidence * aspectScore
+                
+                if score > bestScore {
+                    bestScore = score
+                    bestObservation = observation
+                }
+            }
+            
+            guard let observation = bestObservation else {
+                return nil
+            }
+            
+            ReceiptDebugLogger.shared.logSuccess("Rectangle detected with confidence: \(observation.confidence)")
+            
+            // Apply perspective correction if receipt is skewed
+            return perspectiveCorrect(originalImage, using: observation)
+            
+        } catch {
+            ReceiptDebugLogger.shared.logError("Rectangle detection failed: \(error)")
+            return nil
+        }
+    }
+    
+    /// Apply perspective correction to straighten skewed receipts
+    private func perspectiveCorrect(_ image: UIImage, using observation: VNRectangleObservation) -> UIImage? {
+        guard let ciImage = CIImage(image: image) else {
+            return nil
+        }
+        
+        let topLeft = observation.topLeft
+        let topRight = observation.topRight
+        let bottomLeft = observation.bottomLeft
+        let bottomRight = observation.bottomRight
+        
+        ReceiptDebugLogger.shared.logDebug("Applying perspective correction")
+        ReceiptDebugLogger.shared.logDebug("TL: \(topLeft), TR: \(topRight), BL: \(bottomLeft), BR: \(bottomRight)")
+        
+        // Use CIFilter "CIPerspectiveCorrection"
+        guard let filter = CIFilter(name: "CIPerspectiveCorrection") else {
+            ReceiptDebugLogger.shared.logError("Perspective correction filter not available")
+            return image
+        }
+        
+        let imageSize = image.size
+        
+        filter.setValue(ciImage, forKey: kCIInputImageKey)
+        filter.setValue(
+            CIVector(cgPoint: convertToImageSpace(topLeft, imageSize: imageSize)),
+            forKey: "inputTopLeft"
+        )
+        filter.setValue(
+            CIVector(cgPoint: convertToImageSpace(topRight, imageSize: imageSize)),
+            forKey: "inputTopRight"
+        )
+        filter.setValue(
+            CIVector(cgPoint: convertToImageSpace(bottomLeft, imageSize: imageSize)),
+            forKey: "inputBottomLeft"
+        )
+        filter.setValue(
+            CIVector(cgPoint: convertToImageSpace(bottomRight, imageSize: imageSize)),
+            forKey: "inputBottomRight"
+        )
+        
+        guard let outputImage = filter.outputImage else {
+            ReceiptDebugLogger.shared.logError("Perspective correction produced no output")
+            return image
+        }
+        
+        guard let cgImage = context.createCGImage(outputImage, from: outputImage.extent) else {
+            ReceiptDebugLogger.shared.logError("Failed to create CGImage from corrected image")
+            return image
+        }
+        
+        ReceiptDebugLogger.shared.logSuccess("Perspective correction applied successfully")
+        return UIImage(cgImage: cgImage)
+    }
+    
+    /// Convert Vision normalized coordinates to image space
+    private func convertToImageSpace(_ point: CGPoint, imageSize: CGSize) -> CGPoint {
+        // Vision coordinates: (0,0) at bottom-left, Y increases upward
+        // UIImage coordinates: (0,0) at top-left, Y increases downward
+        return CGPoint(
+            x: point.x * imageSize.width,
+            y: (1 - point.y) * imageSize.height  // Flip Y-axis
+        )
     }
     
     /// Detects receipt using edge detection and contour analysis
