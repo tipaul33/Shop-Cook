@@ -179,9 +179,9 @@ class UnifiedReceiptParser: ReceiptParser {
                 i += 1
                 
             case .nextLine:
-                if let product = parseMultiLineProduct(lines: lines, startIndex: i) {
-                    products.append(product)
-                    i = product.linesConsumed
+                if let result = parseMultiLineProduct(lines: lines, startIndex: i) {
+                    products.append(result.product)
+                    i += result.linesConsumed
                 } else {
                     i += 1
                 }
