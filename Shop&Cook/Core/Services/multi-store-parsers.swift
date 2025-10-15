@@ -328,6 +328,15 @@ class UnifiedReceiptParser: ReceiptParser {
     }
     
     private func categorizeProduct(_ name: String) -> ProductSection {
+        // Try ML classification first (if available)
+        let mlResult = MLProductClassifier.shared.classify(name)
+        
+        // Use ML if confidence is high
+        if mlResult.confidence > 0.7 {
+            return mlResult.category
+        }
+        
+        // Otherwise use rule-based classification
         let lower = name.lowercased()
         
         // Fridge
